@@ -1,7 +1,7 @@
 import pytest
 import unittest
 from enum import Enum
-from random import randint
+import random
 import time
 import threading
 import os
@@ -12,6 +12,7 @@ from datetime import datetime
 from prettytable import PrettyTable
 import functools
 from time import sleep
+from pymilvus import AnnSearchRequest, RRFRanker
 from base.database_wrapper import ApiDatabaseWrapper
 from base.collection_wrapper import ApiCollectionWrapper
 from base.partition_wrapper import ApiPartitionWrapper
@@ -34,7 +35,7 @@ def get_chaos_info():
         with open(constants.CHAOS_INFO_SAVE_PATH, 'r') as f:
             chaos_info = json.load(f)
     except Exception as e:
-        log.error(f"get_chaos_info error: {e}")
+        log.warn(f"get_chaos_info error: {e}")
         return None
     return chaos_info
 
@@ -106,7 +107,11 @@ class RequestRecords(metaclass=Singleton):
     def sink(self):
         if len(self.buffer) == 0:
             return
-        df = pd.DataFrame(self.buffer)
+        try:
+            df = pd.DataFrame(self.buffer)
+        except Exception as e:
+            log.error(f"convert buffer {self.buffer} to dataframe error: {e}")
+            return
         if not self.created_file:
             with request_lock:
                 df.to_parquet(self.file_name, engine='fastparquet')
@@ -187,7 +192,7 @@ class ResultAnalyzer:
     def show_result_table(self):
         table = PrettyTable()
         table.field_names = ['operation_name', 'before_chaos',
-                             f'during_chaos\n{self.chaos_start_time}~{self.recovery_time}',
+                             f'during_chaos: {self.chaos_start_time}~{self.recovery_time}',
                              'after_chaos']
         data = self.get_stage_success_rate()
         for operation, values in data.items():
@@ -202,7 +207,9 @@ class Op(Enum):
     create_collection = 'create_collection'
     create_partition = 'create_partition'
     insert = 'insert'
+    insert_freshness = 'insert_freshness'
     upsert = 'upsert'
+    upsert_freshness = 'upsert_freshness'
     flush = 'flush'
     index = 'index'
     create_index = 'create_index'
@@ -214,8 +221,10 @@ class Op(Enum):
     release_collection = 'release_collection'
     release_partition = 'release_partition'
     search = 'search'
+    hybrid_search = 'hybrid_search'
     query = 'query'
     delete = 'delete'
+    delete_freshness = 'delete_freshness'
     compact = 'compact'
     drop = 'drop'  # short name for drop collection
     drop_db = 'drop_db'
@@ -282,14 +291,22 @@ def exception_handler():
     def wrapper(func):
         @functools.wraps(func)
         def inner_wrapper(self, *args, **kwargs):
+            class_name = None
+            function_name = None
             try:
+                function_name = func.__name__
+                class_name = getattr(self, '__class__', None).__name__ if self else None
                 res, result = func(self, *args, **kwargs)
                 return res, result
             except Exception as e:
                 log_row_length = 300
                 e_str = str(e)
-                log_e = e_str[0:log_row_length] + \
-                        '......' if len(e_str) > log_row_length else e_str
+                log_e = e_str[0:log_row_length] + '......' if len(e_str) > log_row_length else e_str
+                if class_name:
+                    log_message = f"Error in {class_name}.{function_name}: {log_e}"
+                else:
+                    log_message = f"Error in {function_name}: {log_e}"
+                log.error(log_message)
                 log.error(log_e)
                 return Error(e), False
 
@@ -306,7 +323,7 @@ class Checker:
     """
 
     def __init__(self, collection_name=None, partition_name=None, shards_num=2, dim=ct.default_dim, insert_data=True,
-                 schema=None):
+                 schema=None, replica_number=1, **kwargs):
         self.recovery_time = 0
         self._succ = 0
         self._fail = 0
@@ -327,7 +344,7 @@ class Checker:
         p_name = partition_name if partition_name is not None else "_default"
         self.p_name = p_name
         self.p_names = [self.p_name] if partition_name is not None else None
-        schema = cf.gen_default_collection_schema(dim=dim) if schema is None else schema
+        schema = cf.gen_all_datatype_collection_schema(dim=dim) if schema is None else schema
         self.schema = schema
         self.dim = cf.get_dim_by_schema(schema=schema)
         self.int64_field_name = cf.get_int64_field_name(schema=schema)
@@ -337,26 +354,62 @@ class Checker:
                                     shards_num=shards_num,
                                     timeout=timeout,
                                     enable_traceback=enable_traceback)
+        self.scalar_field_names = cf.get_scalar_field_name_list(schema=schema)
+        self.float_vector_field_names = cf.get_float_vec_field_name_list(schema=schema)
+        self.binary_vector_field_names = cf.get_binary_vec_field_name_list(schema=schema)
+        # create index for scalar fields
+        for f in self.scalar_field_names:
+            self.c_wrap.create_index(f,
+                                     {"index_type": "INVERTED"},
+                                     timeout=timeout,
+                                     enable_traceback=enable_traceback,
+                                     check_task=CheckTasks.check_nothing)
+        # create index for float vector fields
+        for f in self.float_vector_field_names:
+            self.c_wrap.create_index(f,
+                                     constants.DEFAULT_INDEX_PARAM,
+                                     timeout=timeout,
+                                     enable_traceback=enable_traceback,
+                                     check_task=CheckTasks.check_nothing)
+        # create index for binary vector fields
+        for f in self.binary_vector_field_names:
+            self.c_wrap.create_index(f,
+                                     constants.DEFAULT_BINARY_INDEX_PARAM,
+                                     timeout=timeout,
+                                     enable_traceback=enable_traceback,
+                                     check_task=CheckTasks.check_nothing)
+        self.replica_number = replica_number
+        self.c_wrap.load(replica_number=self.replica_number)
+
         self.p_wrap.init_partition(self.c_name, self.p_name)
         if insert_data:
             log.info(f"collection {c_name} created, start to insert data")
             t0 = time.perf_counter()
             self.c_wrap.insert(
-                data=cf.get_column_data_by_schema(nb=constants.ENTITIES_FOR_SEARCH, schema=schema, start=0),
+                data=cf.get_column_data_by_schema(nb=constants.ENTITIES_FOR_SEARCH, schema=schema),
                 partition_name=self.p_name,
                 timeout=timeout,
                 enable_traceback=enable_traceback)
             log.info(f"insert data for collection {c_name} cost {time.perf_counter() - t0}s")
 
         self.initial_entities = self.c_wrap.num_entities  # do as a flush
+        self.scale = 100000  # timestamp scale to make time.time() as int64
 
-    def insert_data(self, nb=constants.ENTITIES_FOR_SEARCH, partition_name=None):
+    def insert_data(self, nb=constants.DELTA_PER_INS, partition_name=None):
         partition_name = self.p_name if partition_name is None else partition_name
-        self.c_wrap.insert(
-            data=cf.get_column_data_by_schema(nb=nb, schema=self.schema, start=0),
-            partition_name=partition_name,
-            timeout=timeout,
-            enable_traceback=enable_traceback)
+        data = cf.get_column_data_by_schema(nb=nb, schema=self.schema)
+        ts_data = []
+        for i in range(nb):
+            time.sleep(0.001)
+            offset_ts = int(time.time() * self.scale)
+            ts_data.append(offset_ts)
+        data[0] = ts_data  # set timestamp (ms) as int64
+        res, result = self.c_wrap.insert(data=data,
+                                         partition_name=partition_name,
+                                         timeout=timeout,
+                                         enable_traceback=enable_traceback,
+                                         check_task=CheckTasks.check_nothing)
+        return res, result
 
     def total(self):
         return self._succ + self._fail
@@ -446,14 +499,8 @@ class CollectionLoadChecker(Checker):
     def __init__(self, collection_name=None, shards_num=2, replica_number=1, schema=None, ):
         self.replica_number = replica_number
         if collection_name is None:
-            collection_name = cf.gen_unique_str("LoadChecker_")
+            collection_name = cf.gen_unique_str("CollectionLoadChecker_")
         super().__init__(collection_name=collection_name, shards_num=shards_num, schema=schema)
-        self.c_wrap.create_index(self.float_vector_field_name,
-                                 constants.DEFAULT_INDEX_PARAM,
-                                 index_name=cf.gen_unique_str('index_'),
-                                 timeout=timeout,
-                                 enable_traceback=enable_traceback,
-                                 check_task=CheckTasks.check_nothing)
 
     @trace()
     def load_collection(self):
@@ -479,14 +526,8 @@ class CollectionReleaseChecker(Checker):
     def __init__(self, collection_name=None, shards_num=2, replica_number=1, schema=None, ):
         self.replica_number = replica_number
         if collection_name is None:
-            collection_name = cf.gen_unique_str("LoadChecker_")
+            collection_name = cf.gen_unique_str("CollectionReleaseChecker_")
         super().__init__(collection_name=collection_name, shards_num=shards_num, schema=schema)
-        self.c_wrap.create_index(self.float_vector_field_name,
-                                 constants.DEFAULT_INDEX_PARAM,
-                                 index_name=cf.gen_unique_str('index_'),
-                                 timeout=timeout,
-                                 enable_traceback=enable_traceback,
-                                 check_task=CheckTasks.check_nothing)
         self.c_wrap.load(replica_number=self.replica_number)
 
     @trace()
@@ -513,14 +554,10 @@ class PartitionLoadChecker(Checker):
     def __init__(self, collection_name=None, shards_num=2, replica_number=1, schema=None, ):
         self.replica_number = replica_number
         if collection_name is None:
-            collection_name = cf.gen_unique_str("LoadChecker_")
-        super().__init__(collection_name=collection_name, shards_num=shards_num, schema=schema)
-        self.c_wrap.create_index(self.float_vector_field_name,
-                                 constants.DEFAULT_INDEX_PARAM,
-                                 index_name=cf.gen_unique_str('index_'),
-                                 timeout=timeout,
-                                 enable_traceback=enable_traceback,
-                                 check_task=CheckTasks.check_nothing)
+            collection_name = cf.gen_unique_str("PartitionLoadChecker_")
+        p_name = cf.gen_unique_str("PartitionLoadChecker_")
+        super().__init__(collection_name=collection_name, shards_num=shards_num, schema=schema, partition_name=p_name)
+        self.c_wrap.release()
 
     @trace()
     def load_partition(self):
@@ -546,14 +583,10 @@ class PartitionReleaseChecker(Checker):
     def __init__(self, collection_name=None, shards_num=2, replica_number=1, schema=None, ):
         self.replica_number = replica_number
         if collection_name is None:
-            collection_name = cf.gen_unique_str("LoadChecker_")
-        super().__init__(collection_name=collection_name, shards_num=shards_num, schema=schema)
-        self.c_wrap.create_index(self.float_vector_field_name,
-                                 constants.DEFAULT_INDEX_PARAM,
-                                 index_name=cf.gen_unique_str('index_'),
-                                 timeout=timeout,
-                                 enable_traceback=enable_traceback,
-                                 check_task=CheckTasks.check_nothing)
+            collection_name = cf.gen_unique_str("PartitionReleaseChecker_")
+        p_name = cf.gen_unique_str("PartitionReleaseChecker_")
+        super().__init__(collection_name=collection_name, shards_num=shards_num, schema=schema, partition_name=p_name)
+        self.c_wrap.release()
         self.p_wrap.load(replica_number=self.replica_number)
 
     @trace()
@@ -581,14 +614,6 @@ class SearchChecker(Checker):
         if collection_name is None:
             collection_name = cf.gen_unique_str("SearchChecker_")
         super().__init__(collection_name=collection_name, shards_num=shards_num, schema=schema)
-        self.c_wrap.create_index(self.float_vector_field_name,
-                                 constants.DEFAULT_INDEX_PARAM,
-                                 index_name=cf.gen_unique_str('index_'),
-                                 timeout=timeout,
-                                 enable_traceback=enable_traceback,
-                                 check_task=CheckTasks.check_nothing)
-        # do load before search
-        self.c_wrap.load(replica_number=replica_number)
         self.insert_data()
 
     @trace()
@@ -607,6 +632,55 @@ class SearchChecker(Checker):
     @exception_handler()
     def run_task(self):
         res, result = self.search()
+        return res, result
+
+    def keep_running(self):
+        while self._keep_running:
+            self.run_task()
+            sleep(constants.WAIT_PER_OP / 10)
+
+
+class HybridSearchChecker(Checker):
+    """check hybrid search operations in a dependent thread"""
+
+    def __init__(self, collection_name=None, shards_num=2, replica_number=1, schema=None, ):
+        if collection_name is None:
+            collection_name = cf.gen_unique_str("HybridSearchChecker_")
+        super().__init__(collection_name=collection_name, shards_num=shards_num, schema=schema)
+        # do load before search
+        self.c_wrap.load(replica_number=replica_number)
+        self.insert_data()
+
+    def gen_hybrid_search_request(self):
+        res = []
+        dim = self.dim
+        for vec_field_name in self.float_vector_field_names:
+            search_param = {
+                "data": cf.gen_vectors(1, dim),
+                "anns_field": vec_field_name,
+                "param": constants.DEFAULT_SEARCH_PARAM,
+                "limit": 10,
+                "expr": f"{self.int64_field_name} > 0",
+            }
+            req = AnnSearchRequest(**search_param)
+            res.append(req)
+        return res
+
+    @trace()
+    def hybrid_search(self):
+        res, result = self.c_wrap.hybrid_search(
+            reqs=self.gen_hybrid_search_request(),
+            rerank=RRFRanker(),
+            limit=10,
+            partition_names=self.p_names,
+            timeout=search_timeout,
+            check_task=CheckTasks.check_nothing
+        )
+        return res, result
+
+    @exception_handler()
+    def run_task(self):
+        res, result = self.hybrid_search()
         return res, result
 
     def keep_running(self):
@@ -718,7 +792,7 @@ class InsertChecker(Checker):
             ts_data.append(offset_ts)
 
         data[0] = ts_data  # set timestamp (ms) as int64
-        log.debug(f"insert data: {ts_data}")
+        log.debug(f"insert data: {len(ts_data)}")
         res, result = self.c_wrap.insert(data=data,
                                          partition_names=self.p_names,
                                          timeout=timeout,
@@ -728,6 +802,7 @@ class InsertChecker(Checker):
 
     @exception_handler()
     def run_task(self):
+
         res, result = self.insert_entities()
         return res, result
 
@@ -737,10 +812,10 @@ class InsertChecker(Checker):
             sleep(constants.WAIT_PER_OP / 10)
 
     def verify_data_completeness(self):
+        # deprecated
         try:
             self.c_wrap.create_index(self.float_vector_field_name,
                                      constants.DEFAULT_INDEX_PARAM,
-                                     index_name=cf.gen_unique_str('index_'),
                                      timeout=timeout,
                                      enable_traceback=enable_traceback,
                                      check_task=CheckTasks.check_nothing)
@@ -766,18 +841,76 @@ class InsertChecker(Checker):
         pytest.assume(set(data_in_server) == set(data_in_client))
 
 
-class UpsertChecker(Checker):
-    """check upsert operations in a dependent thread"""
+class InsertFreshnessChecker(Checker):
+    """check insert freshness operations in a dependent thread"""
 
     def __init__(self, collection_name=None, flush=False, shards_num=2, schema=None):
+        self.latest_data = None
         if collection_name is None:
             collection_name = cf.gen_unique_str("InsertChecker_")
         super().__init__(collection_name=collection_name, shards_num=shards_num, schema=schema)
+        self._flush = flush
+        self.initial_entities = self.c_wrap.num_entities
+        self.inserted_data = []
+        self.scale = 1 * 10 ** 6
+        self.start_time_stamp = int(time.time() * self.scale)  # us
+        self.term_expr = f'{self.int64_field_name} >= {self.start_time_stamp}'
+        self.file_name = f"/tmp/ci_logs/insert_data_{uuid.uuid4()}.parquet"
+
+    def insert_entities(self):
+        data = cf.get_column_data_by_schema(nb=constants.DELTA_PER_INS, schema=self.schema)
+        ts_data = []
+        for i in range(constants.DELTA_PER_INS):
+            time.sleep(0.001)
+            offset_ts = int(time.time() * self.scale)
+            ts_data.append(offset_ts)
+
+        data[0] = ts_data  # set timestamp (ms) as int64
+        log.debug(f"insert data: {len(ts_data)}")
+        res, result = self.c_wrap.insert(data=data,
+                                         partition_names=self.p_names,
+                                         timeout=timeout,
+                                         enable_traceback=enable_traceback,
+                                         check_task=CheckTasks.check_nothing)
+        self.latest_data = ts_data[-1]
+        self.term_expr = f'{self.int64_field_name} == {self.latest_data}'
+        return res, result
+
+    @trace()
+    def insert_freshness(self):
+        while True:
+            res, result = self.c_wrap.query(self.term_expr, timeout=timeout,
+                                            output_fields=[f'{self.int64_field_name}'],
+                                            check_task=CheckTasks.check_nothing)
+            if len(res) == 1 and res[0][f"{self.int64_field_name}"] == self.latest_data:
+                break
+        return res, result
+
+    @exception_handler()
+    def run_task(self):
+        res, result = self.insert_entities()
+        res, result = self.insert_freshness()
+        return res, result
+
+    def keep_running(self):
+        while self._keep_running:
+            self.run_task()
+            sleep(constants.WAIT_PER_OP / 10)
+
+
+class UpsertChecker(Checker):
+    """check upsert operations in a dependent thread"""
+
+    def __init__(self, collection_name=None, shards_num=2, schema=None):
+        if collection_name is None:
+            collection_name = cf.gen_unique_str("UpsertChecker_")
+        super().__init__(collection_name=collection_name, shards_num=shards_num, schema=schema)
+        self.data = cf.get_column_data_by_schema(nb=constants.DELTA_PER_INS, schema=self.schema)
 
     @trace()
     def upsert_entities(self):
-        data = cf.get_column_data_by_schema(nb=constants.DELTA_PER_INS, schema=self.schema)
-        res, result = self.c_wrap.upsert(data=data,
+
+        res, result = self.c_wrap.upsert(data=self.data,
                                          timeout=timeout,
                                          enable_traceback=enable_traceback,
                                          check_task=CheckTasks.check_nothing)
@@ -785,13 +918,70 @@ class UpsertChecker(Checker):
 
     @exception_handler()
     def run_task(self):
+        # half of the data is upsert, the other half is insert
+        rows = len(self.data[0])
+        pk_old = self.data[0][:rows // 2]
+        self.data = cf.get_column_data_by_schema(nb=constants.DELTA_PER_INS, schema=self.schema)
+        pk_new = self.data[0][rows // 2:]
+        pk_update = pk_old + pk_new
+        self.data[0] = pk_update
         res, result = self.upsert_entities()
         return res, result
 
     def keep_running(self):
         while self._keep_running:
             self.run_task()
-            sleep(constants.WAIT_PER_OP / 10)
+            sleep(constants.WAIT_PER_OP * 6)
+
+
+class UpsertFreshnessChecker(Checker):
+    """check upsert freshness operations in a dependent thread"""
+
+    def __init__(self, collection_name=None, shards_num=2, schema=None):
+        self.term_expr = None
+        self.latest_data = None
+        if collection_name is None:
+            collection_name = cf.gen_unique_str("UpsertChecker_")
+        super().__init__(collection_name=collection_name, shards_num=shards_num, schema=schema)
+        self.data = cf.get_column_data_by_schema(nb=constants.DELTA_PER_INS, schema=self.schema)
+
+    def upsert_entities(self):
+
+        res, result = self.c_wrap.upsert(data=self.data,
+                                         timeout=timeout,
+                                         enable_traceback=enable_traceback,
+                                         check_task=CheckTasks.check_nothing)
+        return res, result
+
+    @trace()
+    def upsert_freshness(self):
+        while True:
+            res, result = self.c_wrap.query(self.term_expr, timeout=timeout,
+                                            output_fields=[f'{self.int64_field_name}'],
+                                            check_task=CheckTasks.check_nothing)
+            if len(res) == 1 and res[0][f"{self.int64_field_name}"] == self.latest_data:
+                break
+        return res, result
+
+    @exception_handler()
+    def run_task(self):
+        # half of the data is upsert, the other half is insert
+        rows = len(self.data[0])
+        pk_old = self.data[0][:rows // 2]
+        self.data = cf.get_column_data_by_schema(nb=constants.DELTA_PER_INS, schema=self.schema)
+        pk_new = self.data[0][rows // 2:]
+        pk_update = pk_old + pk_new
+        self.data[0] = pk_update
+        self.latest_data = self.data[0][-1]
+        self.term_expr = f'{self.int64_field_name} == {self.latest_data}'
+        res, result = self.upsert_entities()
+        res, result = self.upsert_freshness()
+        return res, result
+
+    def keep_running(self):
+        while self._keep_running:
+            self.run_task()
+            sleep(constants.WAIT_PER_OP * 6)
 
 
 class CollectionCreateChecker(Checker):
@@ -815,8 +1005,10 @@ class CollectionCreateChecker(Checker):
     @exception_handler()
     def run_task(self):
         res, result = self.init_collection()
-        if result:
-            self.c_wrap.drop(timeout=timeout)
+        # if result:
+        #     # 50% chance to drop collection
+        #     if random.randint(0, 1) == 0:
+        #         self.c_wrap.drop(timeout=timeout)
         return res, result
 
     def keep_running(self):
@@ -878,6 +1070,17 @@ class PartitionCreateChecker(Checker):
         if collection_name is None:
             collection_name = cf.gen_unique_str("PartitionCreateChecker_")
         super().__init__(collection_name=collection_name, schema=schema, partition_name=partition_name)
+        c_name = cf.gen_unique_str("PartitionDropChecker_")
+        self.c_wrap.init_collection(name=c_name, schema=self.schema)
+        self.c_name = c_name
+        log.info(f"collection {c_name} created")
+        self.p_wrap.init_partition(collection=self.c_name,
+                                   name=cf.gen_unique_str("PartitionDropChecker_"),
+                                   timeout=timeout,
+                                   enable_traceback=enable_traceback,
+                                   check_task=CheckTasks.check_nothing
+                                   )
+        log.info(f"partition: {self.p_wrap}")
 
     @trace()
     def create_partition(self):
@@ -892,8 +1095,6 @@ class PartitionCreateChecker(Checker):
     @exception_handler()
     def run_task(self):
         res, result = self.create_partition()
-        if result:
-            self.p_wrap.drop(timeout=timeout)
         return res, result
 
     def keep_running(self):
@@ -909,12 +1110,17 @@ class PartitionDropChecker(Checker):
         if collection_name is None:
             collection_name = cf.gen_unique_str("PartitionDropChecker_")
         super().__init__(collection_name=collection_name, schema=schema, partition_name=partition_name)
+        c_name = cf.gen_unique_str("PartitionDropChecker_")
+        self.c_wrap.init_collection(name=c_name, schema=self.schema)
+        self.c_name = c_name
+        log.info(f"collection {c_name} created")
         self.p_wrap.init_partition(collection=self.c_name,
                                    name=cf.gen_unique_str("PartitionDropChecker_"),
                                    timeout=timeout,
                                    enable_traceback=enable_traceback,
                                    check_task=CheckTasks.check_nothing
                                    )
+        log.info(f"partition: {self.p_wrap}")
 
     @trace()
     def drop_partition(self):
@@ -925,12 +1131,14 @@ class PartitionDropChecker(Checker):
     def run_task(self):
         res, result = self.drop_partition()
         if result:
-            self.p_wrap.init_partition(collection=self.c_name,
-                                       name=cf.gen_unique_str("PartitionDropChecker_"),
-                                       timeout=timeout,
-                                       enable_traceback=enable_traceback,
-                                       check_task=CheckTasks.check_nothing
-                                       )
+            # create two partition then drop one
+            for i in range(2):
+                self.p_wrap.init_partition(collection=self.c_name,
+                                           name=cf.gen_unique_str("PartitionDropChecker_"),
+                                           timeout=timeout,
+                                           enable_traceback=enable_traceback,
+                                           check_task=CheckTasks.check_nothing
+                                           )
         return res, result
 
     def keep_running(self):
@@ -1004,7 +1212,6 @@ class IndexCreateChecker(Checker):
         if collection_name is None:
             collection_name = cf.gen_unique_str("IndexChecker_")
         super().__init__(collection_name=collection_name, schema=schema)
-        self.index_name = cf.gen_unique_str('index_')
         for i in range(5):
             self.c_wrap.insert(data=cf.get_column_data_by_schema(nb=constants.ENTITIES_FOR_SEARCH, schema=self.schema),
                                timeout=timeout, enable_traceback=enable_traceback)
@@ -1015,13 +1222,14 @@ class IndexCreateChecker(Checker):
     def create_index(self):
         res, result = self.c_wrap.create_index(self.float_vector_field_name,
                                                constants.DEFAULT_INDEX_PARAM,
-                                               index_name=self.index_name,
                                                enable_traceback=enable_traceback,
                                                check_task=CheckTasks.check_nothing)
         return res, result
 
     @exception_handler()
     def run_task(self):
+        c_name = cf.gen_unique_str("IndexCreateChecker_")
+        self.c_wrap.init_collection(name=c_name, schema=self.schema)
         res, result = self.create_index()
         if result:
             self.c_wrap.drop_index(timeout=timeout)
@@ -1040,17 +1248,11 @@ class IndexDropChecker(Checker):
         if collection_name is None:
             collection_name = cf.gen_unique_str("IndexChecker_")
         super().__init__(collection_name=collection_name, schema=schema)
-        self.index_name = cf.gen_unique_str('index_')
         for i in range(5):
             self.c_wrap.insert(data=cf.get_column_data_by_schema(nb=constants.ENTITIES_FOR_SEARCH, schema=self.schema),
                                timeout=timeout, enable_traceback=enable_traceback)
         # do as a flush before indexing
         log.debug(f"Index ready entities: {self.c_wrap.num_entities}")
-        self.c_wrap.create_index(self.float_vector_field_name,
-                                 constants.DEFAULT_INDEX_PARAM,
-                                 index_name=self.index_name,
-                                 enable_traceback=enable_traceback,
-                                 check_task=CheckTasks.check_nothing)
 
     @trace()
     def drop_index(self):
@@ -1061,15 +1263,20 @@ class IndexDropChecker(Checker):
     def run_task(self):
         res, result = self.drop_index()
         if result:
+            self.c_wrap.init_collection(name=cf.gen_unique_str("IndexDropChecker_"), schema=self.schema)
             self.c_wrap.create_index(self.float_vector_field_name,
                                      constants.DEFAULT_INDEX_PARAM,
-                                     index_name=self.index_name,
                                      enable_traceback=enable_traceback,
                                      check_task=CheckTasks.check_nothing)
         return res, result
 
     def keep_running(self):
         while self._keep_running:
+            self.c_wrap.init_collection(name=cf.gen_unique_str("IndexDropChecker_"), schema=self.schema)
+            self.c_wrap.create_index(self.float_vector_field_name,
+                                     constants.DEFAULT_INDEX_PARAM,
+                                     enable_traceback=enable_traceback,
+                                     check_task=CheckTasks.check_nothing)
             self.run_task()
             sleep(constants.WAIT_PER_OP * 6)
 
@@ -1083,8 +1290,6 @@ class QueryChecker(Checker):
         super().__init__(collection_name=collection_name, shards_num=shards_num, schema=schema)
         res, result = self.c_wrap.create_index(self.float_vector_field_name,
                                                constants.DEFAULT_INDEX_PARAM,
-                                               index_name=cf.gen_unique_str(
-                                                   'index_'),
                                                timeout=timeout,
                                                enable_traceback=enable_traceback,
                                                check_task=CheckTasks.check_nothing)
@@ -1102,7 +1307,7 @@ class QueryChecker(Checker):
     def run_task(self):
         int_values = []
         for _ in range(5):
-            int_values.append(randint(0, constants.ENTITIES_FOR_SEARCH))
+            int_values.append(random.randint(0, constants.ENTITIES_FOR_SEARCH))
         self.term_expr = f'{self.int64_field_name} in {int_values}'
         res, result = self.query()
         return res, result
@@ -1122,35 +1327,117 @@ class DeleteChecker(Checker):
         super().__init__(collection_name=collection_name, schema=schema)
         res, result = self.c_wrap.create_index(self.float_vector_field_name,
                                                constants.DEFAULT_INDEX_PARAM,
-                                               index_name=cf.gen_unique_str(
-                                                   'index_'),
                                                timeout=timeout,
                                                enable_traceback=enable_traceback,
                                                check_task=CheckTasks.check_nothing)
         self.c_wrap.load()  # load before query
         self.insert_data()
-        term_expr = f'{self.int64_field_name} > 0'
-        res, _ = self.c_wrap.query(term_expr, output_fields=[
-            self.int64_field_name])
+        query_expr = f'{self.int64_field_name} > 0'
+        res, _ = self.c_wrap.query(query_expr,
+                                   output_fields=[self.int64_field_name],
+                                   partition_name=self.p_name)
         self.ids = [r[self.int64_field_name] for r in res]
-        self.expr = None
+        self.query_expr = query_expr
+        delete_ids = self.ids[:len(self.ids) // 2]  # delete half of ids
+        self.delete_expr = f'{self.int64_field_name} in {delete_ids}'
+
+    def update_delete_expr(self):
+        res, _ = self.c_wrap.query(self.query_expr,
+                                   output_fields=[self.int64_field_name],
+                                   partition_name=self.p_name)
+        all_ids = [r[self.int64_field_name] for r in res]
+        if len(all_ids) < 100:
+            # insert data to make sure there are enough ids to delete
+            self.insert_data(nb=10000)
+            res, _ = self.c_wrap.query(self.query_expr,
+                                       output_fields=[self.int64_field_name],
+                                       partition_name=self.p_name)
+            all_ids = [r[self.int64_field_name] for r in res]
+        delete_ids = all_ids[:len(all_ids) // 2]  # delete half of ids
+        self.delete_expr = f'{self.int64_field_name} in {delete_ids}'
 
     @trace()
     def delete_entities(self):
-        res, result = self.c_wrap.delete(expr=self.expr, timeout=timeout)
+        res, result = self.c_wrap.delete(expr=self.delete_expr, timeout=timeout, partition_name=self.p_name)
         return res, result
 
     @exception_handler()
     def run_task(self):
-        delete_ids = self.ids.pop()
-        self.expr = f'{self.int64_field_name} in {[delete_ids]}'
+        self.update_delete_expr()
         res, result = self.delete_entities()
         return res, result
 
     def keep_running(self):
         while self._keep_running:
             self.run_task()
-            sleep(constants.WAIT_PER_OP / 10)
+            sleep(constants.WAIT_PER_OP)
+
+
+class DeleteFreshnessChecker(Checker):
+    """check delete freshness operations in a dependent thread"""
+
+    def __init__(self, collection_name=None, schema=None):
+        if collection_name is None:
+            collection_name = cf.gen_unique_str("DeleteChecker_")
+        super().__init__(collection_name=collection_name, schema=schema)
+        res, result = self.c_wrap.create_index(self.float_vector_field_name,
+                                               constants.DEFAULT_INDEX_PARAM,
+                                               index_name=self.index_name,
+                                               timeout=timeout,
+                                               enable_traceback=enable_traceback,
+                                               check_task=CheckTasks.check_nothing)
+        self.c_wrap.load()  # load before query
+        self.insert_data()
+        query_expr = f'{self.int64_field_name} > 0'
+        res, _ = self.c_wrap.query(query_expr,
+                                   output_fields=[self.int64_field_name],
+                                   partition_name=self.p_name)
+        self.ids = [r[self.int64_field_name] for r in res]
+        self.query_expr = query_expr
+        delete_ids = self.ids[:len(self.ids) // 2]  # delete half of ids
+        self.delete_expr = f'{self.int64_field_name} in {delete_ids}'
+
+    def update_delete_expr(self):
+        res, _ = self.c_wrap.query(self.query_expr,
+                                   output_fields=[self.int64_field_name],
+                                   partition_name=self.p_name)
+        all_ids = [r[self.int64_field_name] for r in res]
+        if len(all_ids) < 100:
+            # insert data to make sure there are enough ids to delete
+            self.insert_data(nb=10000)
+            res, _ = self.c_wrap.query(self.query_expr,
+                                       output_fields=[self.int64_field_name],
+                                       partition_name=self.p_name)
+            all_ids = [r[self.int64_field_name] for r in res]
+        delete_ids = all_ids[:len(all_ids) // 2]  # delete half of ids
+        self.delete_expr = f'{self.int64_field_name} in {delete_ids}'
+
+    def delete_entities(self):
+        res, result = self.c_wrap.delete(expr=self.delete_expr, timeout=timeout, partition_name=self.p_name)
+        return res, result
+
+    @trace()
+    def delete_freshness(self):
+        while True:
+            res, result = self.c_wrap.query(self.delete_expr, timeout=timeout,
+                                            output_fields=[f'{self.int64_field_name}'],
+                                            check_task=CheckTasks.check_nothing)
+            if len(res) == 0:
+                break
+        return res, result
+
+    @exception_handler()
+    def run_task(self):
+        self.update_delete_expr()
+        res, result = self.delete_entities()
+        res, result = self.delete_freshness()
+
+        return res, result
+
+    def keep_running(self):
+        while self._keep_running:
+            self.run_task()
+            sleep(constants.WAIT_PER_OP)
 
 
 class CompactChecker(Checker):
@@ -1163,8 +1450,7 @@ class CompactChecker(Checker):
         self.ut = ApiUtilityWrapper()
         res, result = self.c_wrap.create_index(self.float_vector_field_name,
                                                constants.DEFAULT_INDEX_PARAM,
-                                               index_name=cf.gen_unique_str(
-                                                   'index_'),
+                                               index_name=self.index_name,
                                                timeout=timeout,
                                                enable_traceback=enable_traceback,
                                                check_task=CheckTasks.check_nothing)
@@ -1198,8 +1484,7 @@ class LoadBalanceChecker(Checker):
         self.utility_wrap = ApiUtilityWrapper()
         res, result = self.c_wrap.create_index(self.float_vector_field_name,
                                                constants.DEFAULT_INDEX_PARAM,
-                                               index_name=cf.gen_unique_str(
-                                                   'index_'),
+                                               index_name=self.index_name,
                                                timeout=timeout,
                                                enable_traceback=enable_traceback,
                                                check_task=CheckTasks.check_nothing)

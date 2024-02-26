@@ -22,6 +22,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
@@ -458,11 +459,7 @@ func TestDeleteCodec(t *testing.T) {
 		pk1 := &Int64PrimaryKey{
 			Value: 1,
 		}
-		deleteData := &DeleteData{
-			Pks:      []PrimaryKey{pk1},
-			Tss:      []uint64{43757345},
-			RowCount: int64(1),
-		}
+		deleteData := NewDeleteData([]PrimaryKey{pk1}, []uint64{43757345})
 
 		pk2 := &Int64PrimaryKey{
 			Value: 2,
@@ -481,11 +478,7 @@ func TestDeleteCodec(t *testing.T) {
 	t.Run("string pk", func(t *testing.T) {
 		deleteCodec := NewDeleteCodec()
 		pk1 := NewVarCharPrimaryKey("test1")
-		deleteData := &DeleteData{
-			Pks:      []PrimaryKey{pk1},
-			Tss:      []uint64{43757345},
-			RowCount: int64(1),
-		}
+		deleteData := NewDeleteData([]PrimaryKey{pk1}, []uint64{43757345})
 
 		pk2 := NewVarCharPrimaryKey("test2")
 		deleteData.Append(pk2, 23578294723)
@@ -498,64 +491,141 @@ func TestDeleteCodec(t *testing.T) {
 		assert.Equal(t, sid, int64(1))
 		assert.Equal(t, data, deleteData)
 	})
-
-	t.Run("merge", func(t *testing.T) {
-		first := &DeleteData{
-			Pks:      []PrimaryKey{NewInt64PrimaryKey(1)},
-			Tss:      []uint64{100},
-			RowCount: 1,
-		}
-
-		second := &DeleteData{
-			Pks:      []PrimaryKey{NewInt64PrimaryKey(2)},
-			Tss:      []uint64{100},
-			RowCount: 1,
-		}
-
-		first.Merge(second)
-		assert.Equal(t, len(first.Pks), 2)
-		assert.Equal(t, len(first.Tss), 2)
-		assert.Equal(t, first.RowCount, int64(2))
-	})
 }
 
 func TestUpgradeDeleteLog(t *testing.T) {
-	binlogWriter := NewDeleteBinlogWriter(schemapb.DataType_String, CollectionID, 1, 1)
-	eventWriter, err := binlogWriter.NextDeleteEventWriter()
-	assert.NoError(t, err)
-
-	dData := &DeleteData{
-		Pks:      []PrimaryKey{&Int64PrimaryKey{Value: 1}, &Int64PrimaryKey{Value: 2}},
-		Tss:      []Timestamp{100, 200},
-		RowCount: 2,
-	}
-
-	sizeTotal := 0
-	for i := int64(0); i < dData.RowCount; i++ {
-		int64PkValue := dData.Pks[i].(*Int64PrimaryKey).Value
-		ts := dData.Tss[i]
-		err = eventWriter.AddOneStringToPayload(fmt.Sprintf("%d,%d", int64PkValue, ts))
+	t.Run("normal", func(t *testing.T) {
+		binlogWriter := NewDeleteBinlogWriter(schemapb.DataType_String, CollectionID, 1, 1)
+		eventWriter, err := binlogWriter.NextDeleteEventWriter()
 		assert.NoError(t, err)
-		sizeTotal += binary.Size(int64PkValue)
-		sizeTotal += binary.Size(ts)
-	}
-	eventWriter.SetEventTimestamp(100, 200)
-	binlogWriter.SetEventTimeStamp(100, 200)
-	binlogWriter.AddExtra(originalSizeKey, fmt.Sprintf("%v", sizeTotal))
 
-	err = binlogWriter.Finish()
-	assert.NoError(t, err)
-	buffer, err := binlogWriter.GetBuffer()
-	assert.NoError(t, err)
-	blob := &Blob{Value: buffer}
+		dData := &DeleteData{
+			Pks:      []PrimaryKey{&Int64PrimaryKey{Value: 1}, &Int64PrimaryKey{Value: 2}},
+			Tss:      []Timestamp{100, 200},
+			RowCount: 2,
+		}
 
-	dCodec := NewDeleteCodec()
-	parID, segID, deleteData, err := dCodec.Deserialize([]*Blob{blob})
-	assert.NoError(t, err)
-	assert.Equal(t, int64(1), parID)
-	assert.Equal(t, int64(1), segID)
-	assert.ElementsMatch(t, dData.Pks, deleteData.Pks)
-	assert.ElementsMatch(t, dData.Tss, deleteData.Tss)
+		sizeTotal := 0
+		for i := int64(0); i < dData.RowCount; i++ {
+			int64PkValue := dData.Pks[i].(*Int64PrimaryKey).Value
+			ts := dData.Tss[i]
+			err = eventWriter.AddOneStringToPayload(fmt.Sprintf("%d,%d", int64PkValue, ts))
+			assert.NoError(t, err)
+			sizeTotal += binary.Size(int64PkValue)
+			sizeTotal += binary.Size(ts)
+		}
+		eventWriter.SetEventTimestamp(100, 200)
+		binlogWriter.SetEventTimeStamp(100, 200)
+		binlogWriter.AddExtra(originalSizeKey, fmt.Sprintf("%v", sizeTotal))
+
+		err = binlogWriter.Finish()
+		assert.NoError(t, err)
+		buffer, err := binlogWriter.GetBuffer()
+		assert.NoError(t, err)
+		blob := &Blob{Value: buffer}
+
+		dCodec := NewDeleteCodec()
+		parID, segID, deleteData, err := dCodec.Deserialize([]*Blob{blob})
+		assert.NoError(t, err)
+		assert.Equal(t, int64(1), parID)
+		assert.Equal(t, int64(1), segID)
+		assert.ElementsMatch(t, dData.Pks, deleteData.Pks)
+		assert.ElementsMatch(t, dData.Tss, deleteData.Tss)
+	})
+
+	t.Run("with split lenth error", func(t *testing.T) {
+		binlogWriter := NewDeleteBinlogWriter(schemapb.DataType_String, CollectionID, 1, 1)
+		eventWriter, err := binlogWriter.NextDeleteEventWriter()
+		assert.NoError(t, err)
+
+		dData := &DeleteData{
+			Pks:      []PrimaryKey{&Int64PrimaryKey{Value: 1}, &Int64PrimaryKey{Value: 2}},
+			Tss:      []Timestamp{100, 200},
+			RowCount: 2,
+		}
+
+		for i := int64(0); i < dData.RowCount; i++ {
+			int64PkValue := dData.Pks[i].(*Int64PrimaryKey).Value
+			ts := dData.Tss[i]
+			err = eventWriter.AddOneStringToPayload(fmt.Sprintf("%d,%d,?", int64PkValue, ts))
+			assert.NoError(t, err)
+		}
+		eventWriter.SetEventTimestamp(100, 200)
+		binlogWriter.SetEventTimeStamp(100, 200)
+		binlogWriter.AddExtra(originalSizeKey, fmt.Sprintf("%v", 0))
+
+		err = binlogWriter.Finish()
+		assert.NoError(t, err)
+		buffer, err := binlogWriter.GetBuffer()
+		assert.NoError(t, err)
+		blob := &Blob{Value: buffer}
+
+		dCodec := NewDeleteCodec()
+		_, _, _, err = dCodec.Deserialize([]*Blob{blob})
+		assert.Error(t, err)
+	})
+
+	t.Run("with parse int error", func(t *testing.T) {
+		binlogWriter := NewDeleteBinlogWriter(schemapb.DataType_String, CollectionID, 1, 1)
+		eventWriter, err := binlogWriter.NextDeleteEventWriter()
+		assert.NoError(t, err)
+
+		dData := &DeleteData{
+			Pks:      []PrimaryKey{&Int64PrimaryKey{Value: 1}, &Int64PrimaryKey{Value: 2}},
+			Tss:      []Timestamp{100, 200},
+			RowCount: 2,
+		}
+
+		for i := int64(0); i < dData.RowCount; i++ {
+			ts := dData.Tss[i]
+			err = eventWriter.AddOneStringToPayload(fmt.Sprintf("abc,%d", ts))
+			assert.NoError(t, err)
+		}
+		eventWriter.SetEventTimestamp(100, 200)
+		binlogWriter.SetEventTimeStamp(100, 200)
+		binlogWriter.AddExtra(originalSizeKey, fmt.Sprintf("%v", 0))
+
+		err = binlogWriter.Finish()
+		assert.NoError(t, err)
+		buffer, err := binlogWriter.GetBuffer()
+		assert.NoError(t, err)
+		blob := &Blob{Value: buffer}
+
+		dCodec := NewDeleteCodec()
+		_, _, _, err = dCodec.Deserialize([]*Blob{blob})
+		assert.Error(t, err)
+	})
+
+	t.Run("with parse ts uint error", func(t *testing.T) {
+		binlogWriter := NewDeleteBinlogWriter(schemapb.DataType_String, CollectionID, 1, 1)
+		eventWriter, err := binlogWriter.NextDeleteEventWriter()
+		assert.NoError(t, err)
+
+		dData := &DeleteData{
+			Pks:      []PrimaryKey{&Int64PrimaryKey{Value: 1}, &Int64PrimaryKey{Value: 2}},
+			Tss:      []Timestamp{100, 200},
+			RowCount: 2,
+		}
+
+		for i := int64(0); i < dData.RowCount; i++ {
+			int64PkValue := dData.Pks[i].(*Int64PrimaryKey).Value
+			err = eventWriter.AddOneStringToPayload(fmt.Sprintf("%d,abc", int64PkValue))
+			assert.NoError(t, err)
+		}
+		eventWriter.SetEventTimestamp(100, 200)
+		binlogWriter.SetEventTimeStamp(100, 200)
+		binlogWriter.AddExtra(originalSizeKey, fmt.Sprintf("%v", 0))
+
+		err = binlogWriter.Finish()
+		assert.NoError(t, err)
+		buffer, err := binlogWriter.GetBuffer()
+		assert.NoError(t, err)
+		blob := &Blob{Value: buffer}
+
+		dCodec := NewDeleteCodec()
+		_, _, _, err = dCodec.Deserialize([]*Blob{blob})
+		assert.Error(t, err)
+	})
 }
 
 func TestDDCodec(t *testing.T) {
@@ -754,4 +824,44 @@ func TestMemorySize(t *testing.T) {
 	assert.Equal(t, insertDataEmpty.Data[StringField].GetMemorySize(), 0)
 	assert.Equal(t, insertDataEmpty.Data[BinaryVectorField].GetMemorySize(), 4)
 	assert.Equal(t, insertDataEmpty.Data[FloatVectorField].GetMemorySize(), 4)
+}
+
+func TestDeleteData(t *testing.T) {
+	pks, err := GenInt64PrimaryKeys(1, 2, 3)
+	require.NoError(t, err)
+
+	t.Run("merge", func(t *testing.T) {
+		first := NewDeleteData(pks, []Timestamp{100, 101, 102})
+		second := NewDeleteData(pks, []Timestamp{100, 101, 102})
+		require.EqualValues(t, first.RowCount, second.RowCount)
+		require.EqualValues(t, first.Size(), second.Size())
+		require.EqualValues(t, 3, first.RowCount)
+		require.EqualValues(t, 72, first.Size())
+
+		first.Merge(second)
+		assert.Equal(t, len(first.Pks), 6)
+		assert.Equal(t, len(first.Tss), 6)
+		assert.EqualValues(t, first.RowCount, 6)
+		assert.EqualValues(t, first.Size(), 144)
+
+		assert.NotNil(t, second)
+		assert.EqualValues(t, 0, second.RowCount)
+		assert.EqualValues(t, 0, second.Size())
+	})
+
+	t.Run("append", func(t *testing.T) {
+		dData := NewDeleteData(nil, nil)
+		dData.Append(pks[0], 100)
+
+		assert.EqualValues(t, dData.RowCount, 1)
+		assert.EqualValues(t, dData.Size(), 24)
+	})
+
+	t.Run("append batch", func(t *testing.T) {
+		dData := NewDeleteData(nil, nil)
+		dData.AppendBatch(pks, []Timestamp{100, 101, 102})
+
+		assert.EqualValues(t, dData.RowCount, 3)
+		assert.EqualValues(t, dData.Size(), 72)
+	})
 }

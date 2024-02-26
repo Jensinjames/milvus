@@ -28,6 +28,7 @@ import (
 
 // CreateAliasTask contains task information of CreateAlias
 type CreateAliasTask struct {
+	baseTask
 	Condition
 	*milvuspb.CreateAliasRequest
 	ctx       context.Context
@@ -115,6 +116,7 @@ func (t *CreateAliasTask) PostExecute(ctx context.Context) error {
 
 // DropAliasTask is the task to drop alias
 type DropAliasTask struct {
+	baseTask
 	Condition
 	*milvuspb.DropAliasRequest
 	ctx       context.Context
@@ -187,6 +189,7 @@ func (t *DropAliasTask) PostExecute(ctx context.Context) error {
 
 // AlterAliasTask is the task to alter alias
 type AlterAliasTask struct {
+	baseTask
 	Condition
 	*milvuspb.AlterAliasRequest
 	ctx       context.Context
@@ -263,6 +266,7 @@ func (t *AlterAliasTask) PostExecute(ctx context.Context) error {
 
 // DescribeAliasTask is the task to describe alias
 type DescribeAliasTask struct {
+	baseTask
 	Condition
 	nodeID UniqueID
 	*milvuspb.DescribeAliasRequest
@@ -311,6 +315,10 @@ func (a *DescribeAliasTask) OnEnqueue() error {
 func (a *DescribeAliasTask) PreExecute(ctx context.Context) error {
 	a.Base.MsgType = commonpb.MsgType_DescribeAlias
 	a.Base.SourceID = a.nodeID
+	// collection alias uses the same format as collection name
+	if err := ValidateCollectionAlias(a.GetAlias()); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -326,6 +334,7 @@ func (a *DescribeAliasTask) PostExecute(ctx context.Context) error {
 
 // ListAliasesTask is the task to list aliases
 type ListAliasesTask struct {
+	baseTask
 	Condition
 	nodeID UniqueID
 	*milvuspb.ListAliasesRequest
@@ -374,6 +383,12 @@ func (a *ListAliasesTask) OnEnqueue() error {
 func (a *ListAliasesTask) PreExecute(ctx context.Context) error {
 	a.Base.MsgType = commonpb.MsgType_ListAliases
 	a.Base.SourceID = a.nodeID
+
+	if len(a.GetCollectionName()) > 0 {
+		if err := validateCollectionName(a.GetCollectionName()); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

@@ -29,6 +29,7 @@ jobs:
           sed -i "s/milvusdb\/milvus:${{ inputs.oldImageTag }}/milvusdb\/milvus:${{ inputs.imageTag }}/g" deployments/binary/README.md
           sed -i "s/milvusdb\/milvus:${{ inputs.oldImageTag }}/milvusdb\/milvus:${{ inputs.imageTag }}/g" deployments/docker/gpu/standalone/docker-compose.yml
           sed -i "s/milvusdb\/milvus:${{ inputs.oldImageTag }}/milvusdb\/milvus:${{ inputs.imageTag }}/g" deployments/docker/cluster-distributed-deployment/inventory.ini
+          sed -i "s/milvusdb\/milvus:${{ inputs.oldImageTag }}/milvusdb\/milvus:${{ inputs.imageTag }}/g" scripts/standalone_embed.sh
           git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
           git add deployments
@@ -42,7 +43,7 @@ jobs:
           token: ${{ secrets.ALL_CONTRIBUTORS_TOKEN }}
           author: sre-ci-robot <sre-ci-robot@users.noreply.github.com>
           signoff: true
-          branch: update_knowhere_commit_${{ github.sha }}
+          branch: bump_milvus_commit_${{ github.sha }}
           delete-branch: true
           title: '[automated] Bump milvus version to ${{ inputs.imageTag }}'
           body: |

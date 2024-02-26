@@ -16,6 +16,13 @@
 
 package segments
 
+/*
+#cgo pkg-config: milvus_segcore
+
+#include "segcore/load_index_c.h"
+*/
+import "C"
+
 import (
 	"context"
 	"fmt"
@@ -25,6 +32,7 @@ import (
 	"strconv"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/cockroachdb/errors"
 	"github.com/samber/lo"
@@ -395,6 +403,10 @@ func (loader *segmentLoaderV2) loadSegment(ctx context.Context,
 			}
 		}
 
+		if err := segment.AddFieldDataInfo(ctx, loadInfo.GetNumOfRows(), loadInfo.GetBinlogPaths()); err != nil {
+			return err
+		}
+
 		log.Info("load fields...",
 			zap.Int64s("indexedFields", lo.Keys(indexedFieldInfos)),
 		)
@@ -415,9 +427,6 @@ func (loader *segmentLoaderV2) loadSegment(ctx context.Context,
 		})
 
 		if err := loader.loadSealedSegmentFields(ctx, segment, fieldsMap, loadInfo.GetNumOfRows()); err != nil {
-			return err
-		}
-		if err := segment.AddFieldDataInfo(ctx, loadInfo.GetNumOfRows(), loadInfo.GetBinlogPaths()); err != nil {
 			return err
 		}
 		// https://github.com/milvus-io/milvus/23654
@@ -734,8 +743,7 @@ func (loader *segmentLoader) requestResource(ctx context.Context, infos ...*quer
 	// we need to deal with empty infos case separately,
 	// because the following judgement for requested resources are based on current status and static config
 	// which may block empty-load operations by accident
-	if len(infos) == 0 ||
-		infos[0].GetLevel() == datapb.SegmentLevel_L0 {
+	if len(infos) == 0 {
 		return resource, 0, nil
 	}
 
@@ -956,6 +964,10 @@ func (loader *segmentLoader) loadSegment(ctx context.Context,
 
 		schemaHelper, _ := typeutil.CreateSchemaHelper(collection.Schema())
 
+		if err := segment.AddFieldDataInfo(ctx, loadInfo.GetNumOfRows(), loadInfo.GetBinlogPaths()); err != nil {
+			return err
+		}
+
 		log.Info("load fields...",
 			zap.Int64s("indexedFields", lo.Keys(indexedFieldInfos)),
 		)
@@ -976,9 +988,6 @@ func (loader *segmentLoader) loadSegment(ctx context.Context,
 			}
 		}
 		if err := loader.loadSealedSegmentFields(ctx, segment, fieldBinlogs, loadInfo.GetNumOfRows()); err != nil {
-			return err
-		}
-		if err := segment.AddFieldDataInfo(ctx, loadInfo.GetNumOfRows(), loadInfo.GetBinlogPaths()); err != nil {
 			return err
 		}
 		// https://github.com/milvus-io/milvus/23654
@@ -1324,7 +1333,22 @@ func GetIndexResourceUsage(indexInfo *querypb.FieldIndexInfo) (uint64, uint64, e
 		return uint64(neededMemSize), uint64(neededDiskSize), nil
 	}
 
-	return uint64(indexInfo.IndexSize), 0, nil
+	factor := uint64(1)
+
+	var isLoadWithDisk bool
+	GetDynamicPool().Submit(func() (any, error) {
+		cIndexType := C.CString(indexType)
+		defer C.free(unsafe.Pointer(cIndexType))
+		cEngineVersion := C.int32_t(indexInfo.GetCurrentIndexVersion())
+		isLoadWithDisk = bool(C.IsLoadWithDisk(cIndexType, cEngineVersion))
+		return nil, nil
+	}).Await()
+
+	if !isLoadWithDisk {
+		factor = 2
+	}
+
+	return uint64(indexInfo.IndexSize) * factor, 0, nil
 }
 
 // checkSegmentSize checks whether the memory & disk is sufficient to load the segments
@@ -1418,7 +1442,7 @@ func (loader *segmentLoader) checkSegmentSize(ctx context.Context, segmentLoadIn
 
 		// get size of delete data
 		for _, fieldBinlog := range loadInfo.Deltalogs {
-			predictMemUsage += uint64(getBinlogDataSize(fieldBinlog))
+			predictMemUsage += uint64(float64(getBinlogDataSize(fieldBinlog)) * paramtable.Get().QueryNodeCfg.DeltaDataExpansionRate.GetAsFloat())
 		}
 
 		if predictMemUsage-oldUsedMem > maxSegmentSize {

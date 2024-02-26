@@ -291,6 +291,47 @@ func (_c *MockQueryNode_GetMetrics_Call) RunAndReturn(run func(context.Context, 
 	return _c
 }
 
+// GetNodeID provides a mock function with given fields:
+func (_m *MockQueryNode) GetNodeID() int64 {
+	ret := _m.Called()
+
+	var r0 int64
+	if rf, ok := ret.Get(0).(func() int64); ok {
+		r0 = rf()
+	} else {
+		r0 = ret.Get(0).(int64)
+	}
+
+	return r0
+}
+
+// MockQueryNode_GetNodeID_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'GetNodeID'
+type MockQueryNode_GetNodeID_Call struct {
+	*mock.Call
+}
+
+// GetNodeID is a helper method to define mock.On call
+func (_e *MockQueryNode_Expecter) GetNodeID() *MockQueryNode_GetNodeID_Call {
+	return &MockQueryNode_GetNodeID_Call{Call: _e.mock.On("GetNodeID")}
+}
+
+func (_c *MockQueryNode_GetNodeID_Call) Run(run func()) *MockQueryNode_GetNodeID_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run()
+	})
+	return _c
+}
+
+func (_c *MockQueryNode_GetNodeID_Call) Return(_a0 int64) *MockQueryNode_GetNodeID_Call {
+	_c.Call.Return(_a0)
+	return _c
+}
+
+func (_c *MockQueryNode_GetNodeID_Call) RunAndReturn(run func() int64) *MockQueryNode_GetNodeID_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
 // GetSegmentInfo provides a mock function with given fields: _a0, _a1
 func (_m *MockQueryNode) GetSegmentInfo(_a0 context.Context, _a1 *querypb.GetSegmentInfoRequest) (*querypb.GetSegmentInfoResponse, error) {
 	ret := _m.Called(_a0, _a1)
@@ -507,6 +548,61 @@ func (_c *MockQueryNode_GetTimeTickChannel_Call) Return(_a0 *milvuspb.StringResp
 }
 
 func (_c *MockQueryNode_GetTimeTickChannel_Call) RunAndReturn(run func(context.Context, *internalpb.GetTimeTickChannelRequest) (*milvuspb.StringResponse, error)) *MockQueryNode_GetTimeTickChannel_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
+// HybridSearch provides a mock function with given fields: _a0, _a1
+func (_m *MockQueryNode) HybridSearch(_a0 context.Context, _a1 *querypb.HybridSearchRequest) (*querypb.HybridSearchResult, error) {
+	ret := _m.Called(_a0, _a1)
+
+	var r0 *querypb.HybridSearchResult
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context, *querypb.HybridSearchRequest) (*querypb.HybridSearchResult, error)); ok {
+		return rf(_a0, _a1)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context, *querypb.HybridSearchRequest) *querypb.HybridSearchResult); ok {
+		r0 = rf(_a0, _a1)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).(*querypb.HybridSearchResult)
+		}
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context, *querypb.HybridSearchRequest) error); ok {
+		r1 = rf(_a0, _a1)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
+// MockQueryNode_HybridSearch_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'HybridSearch'
+type MockQueryNode_HybridSearch_Call struct {
+	*mock.Call
+}
+
+// HybridSearch is a helper method to define mock.On call
+//   - _a0 context.Context
+//   - _a1 *querypb.HybridSearchRequest
+func (_e *MockQueryNode_Expecter) HybridSearch(_a0 interface{}, _a1 interface{}) *MockQueryNode_HybridSearch_Call {
+	return &MockQueryNode_HybridSearch_Call{Call: _e.mock.On("HybridSearch", _a0, _a1)}
+}
+
+func (_c *MockQueryNode_HybridSearch_Call) Run(run func(_a0 context.Context, _a1 *querypb.HybridSearchRequest)) *MockQueryNode_HybridSearch_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(context.Context), args[1].(*querypb.HybridSearchRequest))
+	})
+	return _c
+}
+
+func (_c *MockQueryNode_HybridSearch_Call) Return(_a0 *querypb.HybridSearchResult, _a1 error) *MockQueryNode_HybridSearch_Call {
+	_c.Call.Return(_a0, _a1)
+	return _c
+}
+
+func (_c *MockQueryNode_HybridSearch_Call) RunAndReturn(run func(context.Context, *querypb.HybridSearchRequest) (*querypb.HybridSearchResult, error)) *MockQueryNode_HybridSearch_Call {
 	_c.Call.Return(run)
 	return _c
 }

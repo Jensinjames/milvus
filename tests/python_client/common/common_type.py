@@ -44,6 +44,8 @@ default_int32_array_field_name = "int32_array"
 default_float_array_field_name = "float_array"
 default_string_array_field_name = "string_array"
 default_float_vec_field_name = "float_vector"
+default_float16_vec_field_name = "float16_vector"
+default_bfloat16_vec_field_name = "bfloat16_vector"
 another_float_vec_field_name = "float_vector1"
 default_binary_vec_field_name = "binary_vector"
 default_partition_name = "_default"
@@ -81,6 +83,7 @@ default_db = "default"
 max_database_num = 64
 max_collections_per_db = 65536
 max_collection_num = 65536
+max_hybrid_search_req_num = 1024
 
 
 IMAGE_REPOSITORY_MILVUS = "harbor.milvus.io/dockerhub/milvusdb/milvus"
@@ -270,6 +273,7 @@ class CheckTasks:
     check_merge_compact = "check_merge_compact"
     check_role_property = "check_role_property"
     check_permission_deny = "check_permission_deny"
+    check_auth_failure = "check_auth_failure"
     check_value_equal = "check_value_equal"
     check_rg_property = "check_resource_group_property"
     check_describe_collection_property = "check_describe_collection_property"

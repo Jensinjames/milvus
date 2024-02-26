@@ -34,6 +34,7 @@ import (
 type BaseDeleteTask = msgstream.DeleteMsg
 
 type deleteTask struct {
+	baseTask
 	Condition
 	ctx context.Context
 	tr  *timerecord.TimeRecorder
@@ -302,7 +303,7 @@ func (dr *deleteRunner) Init(ctx context.Context) error {
 func (dr *deleteRunner) Run(ctx context.Context) error {
 	plan, err := planparserv2.CreateRetrievePlan(dr.schema.CollectionSchema, dr.req.Expr)
 	if err != nil {
-		return fmt.Errorf("failed to create expr plan, expr = %s", dr.req.GetExpr())
+		return merr.WrapErrParameterInvalidMsg("failed to create delete plan: %v", err)
 	}
 
 	isSimple, pk, numRow := getPrimaryKeysFromPlan(dr.schema.CollectionSchema, plan)

@@ -23,7 +23,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/cockroachdb/errors"
 	"github.com/samber/lo"
@@ -36,7 +35,6 @@ import (
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
 	"github.com/milvus-io/milvus/internal/proto/querypb"
 	"github.com/milvus-io/milvus/internal/proto/rootcoordpb"
-	"github.com/milvus-io/milvus/internal/querycoordv2/params"
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/pkg/common"
 	"github.com/milvus-io/milvus/pkg/log"
@@ -73,7 +71,6 @@ type Cache interface {
 	GetCollectionSchema(ctx context.Context, database, collectionName string) (*schemaInfo, error)
 	GetShards(ctx context.Context, withCache bool, database, collectionName string, collectionID int64) (map[string][]nodeInfo, error)
 	DeprecateShardCache(database, collectionName string)
-	expireShardLeaderCache(ctx context.Context)
 	RemoveCollection(ctx context.Context, database, collectionName string)
 	RemoveCollectionsByID(ctx context.Context, collectionID UniqueID) []string
 	RemovePartition(ctx context.Context, database, collectionName string, partitionName string)
@@ -90,6 +87,8 @@ type Cache interface {
 
 	RemoveDatabase(ctx context.Context, database string)
 	HasDatabase(ctx context.Context, database string) bool
+	// AllocID is only using on requests that need to skip timestamp allocation, don't overuse it.
+	AllocID(ctx context.Context) (int64, error)
 }
 
 type collectionBasicInfo struct {
@@ -249,6 +248,11 @@ type MetaCache struct {
 	leaderMut      sync.RWMutex
 	shardMgr       shardClientMgr
 	sfGlobal       conc.Singleflight[*collectionInfo]
+
+	IDStart int64
+	IDCount int64
+	IDIndex int64
+	IDLock  sync.RWMutex
 }
 
 // globalMetaCache is singleton instance of Cache
@@ -270,7 +274,6 @@ func InitMetaCache(ctx context.Context, rootCoord types.RootCoordClient, queryCo
 	}
 	globalMetaCache.InitPolicyInfo(resp.PolicyInfos, resp.UserRoles)
 	log.Info("success to init meta cache", zap.Strings("policy_infos", resp.PolicyInfos))
-	globalMetaCache.expireShardLeaderCache(ctx)
 	return nil
 }
 
@@ -875,33 +878,6 @@ func (m *MetaCache) DeprecateShardCache(database, collectionName string) {
 	}
 }
 
-func (m *MetaCache) expireShardLeaderCache(ctx context.Context) {
-	log := log.Ctx(ctx).WithRateGroup("proxy.expireShardLeaderCache", 1, 60)
-	go func() {
-		ticker := time.NewTicker(params.Params.ProxyCfg.ShardLeaderCacheInterval.GetAsDuration(time.Second))
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ctx.Done():
-				log.Info("stop periodically update meta cache")
-				return
-			case <-ticker.C:
-				m.leaderMut.RLock()
-				for database, db := range m.collLeader {
-					log.RatedInfo(10, "expire all shard leader cache",
-						zap.String("database", database),
-						zap.Strings("collections", lo.Keys(db)))
-					for _, shards := range db {
-						shards.deprecated.Store(true)
-					}
-				}
-				m.leaderMut.RUnlock()
-			}
-		}
-	}()
-}
-
 func (m *MetaCache) InitPolicyInfo(info []string, userRoles []string) {
 	defer func() {
 		err := getEnforcer().LoadPolicy()
@@ -1017,4 +993,28 @@ func (m *MetaCache) HasDatabase(ctx context.Context, database string) bool {
 	defer m.mu.RUnlock()
 	_, ok := m.collInfo[database]
 	return ok
+}
+
+func (m *MetaCache) AllocID(ctx context.Context) (int64, error) {
+	m.IDLock.Lock()
+	defer m.IDLock.Unlock()
+
+	if m.IDIndex == m.IDCount {
+		resp, err := m.rootCoord.AllocID(ctx, &rootcoordpb.AllocIDRequest{
+			Count: 1000000,
+		})
+		if err != nil {
+			log.Warn("Refreshing ID cache from rootcoord failed", zap.Error(err))
+			return 0, err
+		}
+		if resp.GetStatus().GetCode() != 0 {
+			log.Warn("Refreshing ID cache from rootcoord failed", zap.String("failed detail", resp.GetStatus().GetDetail()))
+			return 0, merr.WrapErrServiceInternal(resp.GetStatus().GetDetail())
+		}
+		m.IDStart, m.IDCount = resp.GetID(), int64(resp.GetCount())
+		m.IDIndex = 0
+	}
+	id := m.IDStart + m.IDIndex
+	m.IDIndex++
+	return id, nil
 }

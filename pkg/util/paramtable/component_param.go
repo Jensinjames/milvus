@@ -154,12 +154,19 @@ func (p *ComponentParam) Watch(key string, watcher config.EventHandler) {
 	p.baseTable.mgr.Dispatcher.Register(key, watcher)
 }
 
+func (p *ComponentParam) WatchKeyPrefix(keyPrefix string, watcher config.EventHandler) {
+	p.baseTable.mgr.Dispatcher.RegisterForKeyPrefix(keyPrefix, watcher)
+}
+
 func (p *ComponentParam) Unwatch(key string, watcher config.EventHandler) {
 	p.baseTable.mgr.Dispatcher.Unregister(key, watcher)
 }
 
-func (p *ComponentParam) WatchKeyPrefix(keyPrefix string, watcher config.EventHandler) {
-	p.baseTable.mgr.Dispatcher.RegisterForKeyPrefix(keyPrefix, watcher)
+// FOR TEST
+
+// clean all config event in dispatcher
+func (p *ComponentParam) CleanEvent() {
+	p.baseTable.mgr.Dispatcher.Clean()
 }
 
 // /////////////////////////////////////////////////////////////////////////////
@@ -191,6 +198,7 @@ type commonConfig struct {
 	MiddlePriorityThreadCoreCoefficient ParamItem `refreshable:"false"`
 	LowPriorityThreadCoreCoefficient    ParamItem `refreshable:"false"`
 	EnableNodeFilteringOnPartitionKey   ParamItem `refreshable:"false"`
+	BuildIndexThreadPoolRatio           ParamItem `refreshable:"false"`
 	MaxDegree                           ParamItem `refreshable:"true"`
 	SearchListSize                      ParamItem `refreshable:"true"`
 	PQCodeBudgetGBRatio                 ParamItem `refreshable:"true"`
@@ -543,6 +551,14 @@ This configuration is only used by querynode and indexnode, it selects CPU instr
 		Export: true,
 	}
 	p.LowPriorityThreadCoreCoefficient.Init(base.mgr)
+
+	p.BuildIndexThreadPoolRatio = ParamItem{
+		Key:          "common.buildIndexThreadPoolRatio",
+		Version:      "2.4.0",
+		DefaultValue: strconv.FormatFloat(DefaultKnowhereThreadPoolNumRatioInBuildOfStandalone, 'f', 2, 64),
+		Export:       true,
+	}
+	p.BuildIndexThreadPoolRatio.Init(base.mgr)
 
 	p.AuthorizationEnabled = ParamItem{
 		Key:          "common.security.authorizationEnabled",
@@ -1102,17 +1118,15 @@ So adjust at your risk!`,
 		Key:          "proxy.maxVectorFieldNum",
 		Version:      "2.4.0",
 		DefaultValue: "4",
-		Formatter: func(v string) string {
-			if getAsInt(v) > 10 {
-				return "10"
-			}
-			return v
-		},
 		PanicIfEmpty: true,
 		Doc:          "Maximum number of vector fields in a collection.",
 		Export:       true,
 	}
 	p.MaxVectorFieldNum.Init(base.mgr)
+
+	if p.MaxVectorFieldNum.GetAsInt() > 10 || p.MaxVectorFieldNum.GetAsInt() <= 0 {
+		panic(fmt.Sprintf("Maximum number of vector fields in a collection should be in (0, 10], not %d", p.MaxVectorFieldNum.GetAsInt()))
+	}
 
 	p.MaxShardNum = ParamItem{
 		Key:          "proxy.maxShardNum",
@@ -1355,6 +1369,14 @@ type queryCoordConfig struct {
 	OverloadedMemoryThresholdPercentage ParamItem `refreshable:"true"`
 	BalanceIntervalSeconds              ParamItem `refreshable:"true"`
 	MemoryUsageMaxDifferencePercentage  ParamItem `refreshable:"true"`
+	RowCountFactor                      ParamItem `refreshable:"true"`
+	SegmentCountFactor                  ParamItem `refreshable:"true"`
+	GlobalSegmentCountFactor            ParamItem `refreshable:"true"`
+	SegmentCountMaxSteps                ParamItem `refreshable:"true"`
+	RowCountMaxSteps                    ParamItem `refreshable:"true"`
+	RandomMaxSteps                      ParamItem `refreshable:"true"`
+	GrowingRowCountWeight               ParamItem `refreshable:"true"`
+	BalanceCostThreshold                ParamItem `refreshable:"true"`
 
 	SegmentCheckInterval       ParamItem `refreshable:"true"`
 	ChannelCheckInterval       ParamItem `refreshable:"true"`
@@ -1473,6 +1495,66 @@ func (p *queryCoordConfig) init(base *BaseTable) {
 	}
 	p.GlobalRowCountFactor.Init(base.mgr)
 
+	p.RowCountFactor = ParamItem{
+		Key:          "queryCoord.rowCountFactor",
+		Version:      "2.3.0",
+		DefaultValue: "0.4",
+		PanicIfEmpty: true,
+		Doc:          "the row count weight used when balancing segments among queryNodes",
+		Export:       true,
+	}
+	p.RowCountFactor.Init(base.mgr)
+
+	p.SegmentCountFactor = ParamItem{
+		Key:          "queryCoord.segmentCountFactor",
+		Version:      "2.3.0",
+		DefaultValue: "0.4",
+		PanicIfEmpty: true,
+		Doc:          "the segment count weight used when balancing segments among queryNodes",
+		Export:       true,
+	}
+	p.SegmentCountFactor.Init(base.mgr)
+
+	p.GlobalSegmentCountFactor = ParamItem{
+		Key:          "queryCoord.globalSegmentCountFactor",
+		Version:      "2.3.0",
+		DefaultValue: "0.1",
+		PanicIfEmpty: true,
+		Doc:          "the segment count weight used when balancing segments among queryNodes",
+		Export:       true,
+	}
+	p.GlobalSegmentCountFactor.Init(base.mgr)
+
+	p.SegmentCountMaxSteps = ParamItem{
+		Key:          "queryCoord.segmentCountMaxSteps",
+		Version:      "2.3.0",
+		DefaultValue: "50",
+		PanicIfEmpty: true,
+		Doc:          "segment count based plan generator max steps",
+		Export:       true,
+	}
+	p.SegmentCountMaxSteps.Init(base.mgr)
+
+	p.RowCountMaxSteps = ParamItem{
+		Key:          "queryCoord.rowCountMaxSteps",
+		Version:      "2.3.0",
+		DefaultValue: "50",
+		PanicIfEmpty: true,
+		Doc:          "segment count based plan generator max steps",
+		Export:       true,
+	}
+	p.RowCountMaxSteps.Init(base.mgr)
+
+	p.RandomMaxSteps = ParamItem{
+		Key:          "queryCoord.randomMaxSteps",
+		Version:      "2.3.0",
+		DefaultValue: "10",
+		PanicIfEmpty: true,
+		Doc:          "segment count based plan generator max steps",
+		Export:       true,
+	}
+	p.RandomMaxSteps.Init(base.mgr)
+
 	p.ScoreUnbalanceTolerationFactor = ParamItem{
 		Key:          "queryCoord.scoreUnbalanceTolerationFactor",
 		Version:      "2.0.0",
@@ -1511,6 +1593,26 @@ func (p *queryCoordConfig) init(base *BaseTable) {
 		Export:       true,
 	}
 	p.BalanceIntervalSeconds.Init(base.mgr)
+
+	p.GrowingRowCountWeight = ParamItem{
+		Key:          "queryCoord.growingRowCountWeight",
+		Version:      "2.3.5",
+		DefaultValue: "4.0",
+		PanicIfEmpty: true,
+		Doc:          "the memory weight of growing segment row count",
+		Export:       true,
+	}
+	p.GrowingRowCountWeight.Init(base.mgr)
+
+	p.BalanceCostThreshold = ParamItem{
+		Key:          "queryCoord.balanceCostThreshold",
+		Version:      "2.3.5",
+		DefaultValue: "0.001",
+		PanicIfEmpty: true,
+		Doc:          "the threshold of balance cost",
+		Export:       true,
+	}
+	p.BalanceCostThreshold.Init(base.mgr)
 
 	p.MemoryUsageMaxDifferencePercentage = ParamItem{
 		Key:          "queryCoord.memoryUsageMaxDifferencePercentage",
@@ -1804,7 +1906,8 @@ type queryNodeConfig struct {
 	MmapDirPath      ParamItem `refreshable:"false"`
 
 	// chunk cache
-	ReadAheadPolicy ParamItem `refreshable:"false"`
+	ReadAheadPolicy     ParamItem `refreshable:"false"`
+	ChunkCacheWarmingUp ParamItem `refreshable:"true"`
 
 	GroupEnabled          ParamItem `refreshable:"true"`
 	MaxReceiveChanSize    ParamItem `refreshable:"false"`
@@ -1827,7 +1930,8 @@ type queryNodeConfig struct {
 	DeleteBufferBlockSize  ParamItem `refreshable:"false"`
 
 	// loader
-	IoPoolSize ParamItem `refreshable:"false"`
+	IoPoolSize             ParamItem `refreshable:"false"`
+	DeltaDataExpansionRate ParamItem `refreshable:"true"`
 
 	// schedule task policy.
 	SchedulePolicyName                    ParamItem `refreshable:"false"`
@@ -2012,6 +2116,19 @@ func (p *queryNodeConfig) init(base *BaseTable) {
 		Doc:          "The read ahead policy of chunk cache, options: `normal, random, sequential, willneed, dontneed`",
 	}
 	p.ReadAheadPolicy.Init(base.mgr)
+
+	p.ChunkCacheWarmingUp = ParamItem{
+		Key:          "queryNode.cache.warmup",
+		Version:      "2.3.6",
+		DefaultValue: "async",
+		Doc: `options: async, sync, off. 
+Specifies the necessity for warming up the chunk cache. 
+1. If set to "sync" or "async," the original vector data will be synchronously/asynchronously loaded into the 
+chunk cache during the load process. This approach has the potential to substantially reduce query/search latency
+for a specific duration post-load, albeit accompanied by a concurrent increase in disk usage;
+2. If set to "off," original vector data will only be loaded into the chunk cache during search/query.`,
+	}
+	p.ChunkCacheWarmingUp.Init(base.mgr)
 
 	p.GroupEnabled = ParamItem{
 		Key:          "queryNode.grouping.enabled",
@@ -2198,6 +2315,14 @@ Max read concurrency must greater than or equal to 1, and less than or equal to 
 	}
 	p.IoPoolSize.Init(base.mgr)
 
+	p.DeltaDataExpansionRate = ParamItem{
+		Key:          "querynode.deltaDataExpansionRate",
+		Version:      "2.4.0",
+		DefaultValue: "50",
+		Doc:          "the expansion rate for deltalog physical size to actual memory usage",
+	}
+	p.DeltaDataExpansionRate.Init(base.mgr)
+
 	// schedule read task policy.
 	p.SchedulePolicyName = ParamItem{
 		Key:          "queryNode.scheduler.scheduleReadPolicy.name",
@@ -2300,7 +2425,9 @@ type dataCoordConfig struct {
 	// LevelZero Segment
 	EnableLevelZeroSegment                   ParamItem `refreshable:"false"`
 	LevelZeroCompactionTriggerMinSize        ParamItem `refreshable:"true"`
+	LevelZeroCompactionTriggerMaxSize        ParamItem `refreshable:"true"`
 	LevelZeroCompactionTriggerDeltalogMinNum ParamItem `refreshable:"true"`
+	LevelZeroCompactionTriggerDeltalogMaxNum ParamItem `refreshable:"true"`
 
 	// Garbage Collection
 	EnableGarbageCollection ParamItem `refreshable:"false"`
@@ -2373,7 +2500,7 @@ func (p *dataCoordConfig) init(base *BaseTable) {
 	p.SegmentMaxSize = ParamItem{
 		Key:          "dataCoord.segment.maxSize",
 		Version:      "2.0.0",
-		DefaultValue: "512",
+		DefaultValue: "1024",
 		Doc:          "Maximum size of a segment in MB",
 		Export:       true,
 	}
@@ -2382,7 +2509,7 @@ func (p *dataCoordConfig) init(base *BaseTable) {
 	p.DiskSegmentMaxSize = ParamItem{
 		Key:          "dataCoord.segment.diskSegmentMaxSize",
 		Version:      "2.0.0",
-		DefaultValue: "512",
+		DefaultValue: "2048",
 		Doc:          "Maximun size of a segment in MB for collection which has Disk index",
 		Export:       true,
 	}
@@ -2391,7 +2518,7 @@ func (p *dataCoordConfig) init(base *BaseTable) {
 	p.SegmentSealProportion = ParamItem{
 		Key:          "dataCoord.segment.sealProportion",
 		Version:      "2.0.0",
-		DefaultValue: "0.23",
+		DefaultValue: "0.12",
 		Export:       true,
 	}
 	p.SegmentSealProportion.Init(base.mgr)
@@ -2598,7 +2725,7 @@ During compaction, the size of segment # of rows is able to exceed segment max #
 	// LevelZeroCompaction
 	p.EnableLevelZeroSegment = ParamItem{
 		Key:          "dataCoord.segment.enableLevelZero",
-		Version:      "2.3.4",
+		Version:      "2.4.0",
 		Doc:          "Whether to enable LevelZeroCompaction",
 		DefaultValue: "false",
 	}
@@ -2606,19 +2733,35 @@ During compaction, the size of segment # of rows is able to exceed segment max #
 
 	p.LevelZeroCompactionTriggerMinSize = ParamItem{
 		Key:          "dataCoord.compaction.levelzero.forceTrigger.minSize",
-		Version:      "2.3.4",
-		Doc:          "The minmum size in MB to force trigger a LevelZero Compaction",
-		DefaultValue: "8",
+		Version:      "2.4.0",
+		Doc:          "The minmum size in bytes to force trigger a LevelZero Compaction, default as 8MB",
+		DefaultValue: "8388608",
 	}
 	p.LevelZeroCompactionTriggerMinSize.Init(base.mgr)
 
+	p.LevelZeroCompactionTriggerMaxSize = ParamItem{
+		Key:          "dataCoord.compaction.levelzero.forceTrigger.maxSize",
+		Version:      "2.4.0",
+		Doc:          "The maxmum size in bytes to force trigger a LevelZero Compaction, default as 64MB",
+		DefaultValue: "67108864",
+	}
+	p.LevelZeroCompactionTriggerMaxSize.Init(base.mgr)
+
 	p.LevelZeroCompactionTriggerDeltalogMinNum = ParamItem{
 		Key:          "dataCoord.compaction.levelzero.forceTrigger.deltalogMinNum",
-		Version:      "2.3.4",
+		Version:      "2.4.0",
 		Doc:          "The minimum number of deltalog files to force trigger a LevelZero Compaction",
 		DefaultValue: "10",
 	}
 	p.LevelZeroCompactionTriggerDeltalogMinNum.Init(base.mgr)
+
+	p.LevelZeroCompactionTriggerDeltalogMaxNum = ParamItem{
+		Key:          "dataCoord.compaction.levelzero.forceTrigger.deltalogMaxNum",
+		Version:      "2.4.0",
+		Doc:          "The maxmum number of deltalog files to force trigger a LevelZero Compaction, default as 30",
+		DefaultValue: "30",
+	}
+	p.LevelZeroCompactionTriggerDeltalogMaxNum.Init(base.mgr)
 
 	p.EnableGarbageCollection = ParamItem{
 		Key:          "dataCoord.enableGarbageCollection",
@@ -2793,6 +2936,7 @@ type dataNodeConfig struct {
 	// memory management
 	MemoryForceSyncEnable     ParamItem `refreshable:"true"`
 	MemoryForceSyncSegmentNum ParamItem `refreshable:"true"`
+	MemoryCheckInterval       ParamItem `refreshable:"true"`
 	MemoryWatermark           ParamItem `refreshable:"true"`
 
 	DataNodeTimeTickByRPC ParamItem `refreshable:"false"`
@@ -2811,6 +2955,13 @@ type dataNodeConfig struct {
 	ChannelWorkPoolSize ParamItem `refreshable:"true"`
 
 	UpdateChannelCheckpointMaxParallel ParamItem `refreshable:"true"`
+	UpdateChannelCheckpointInterval    ParamItem `refreshable:"true"`
+	UpdateChannelCheckpointRPCTimeout  ParamItem `refreshable:"true"`
+
+	MaxConcurrentImportTaskNum ParamItem `refreshable:"true"`
+
+	// Compaction
+	L0BatchMemoryRatio ParamItem `refreshable:"true"`
 }
 
 func (p *dataNodeConfig) init(base *BaseTable) {
@@ -2874,7 +3025,7 @@ func (p *dataNodeConfig) init(base *BaseTable) {
 	p.MaxParallelSyncMgrTasks = ParamItem{
 		Key:          "dataNode.dataSync.maxParallelSyncMgrTasks",
 		Version:      "2.3.4",
-		DefaultValue: "64",
+		DefaultValue: "256",
 		Doc:          "The max concurrent sync task number of datanode sync mgr globally",
 		Export:       true,
 	}
@@ -2905,6 +3056,15 @@ func (p *dataNodeConfig) init(base *BaseTable) {
 	}
 	p.MemoryForceSyncSegmentNum.Init(base.mgr)
 
+	p.MemoryCheckInterval = ParamItem{
+		Key:          "datanode.memory.checkInterval",
+		Version:      "2.4.0",
+		DefaultValue: "3000", // milliseconds
+		Doc:          "the interal to check datanode memory usage, in milliseconds",
+		Export:       true,
+	}
+	p.MemoryCheckInterval.Init(base.mgr)
+
 	if os.Getenv(metricsinfo.DeployModeEnvKey) == metricsinfo.StandaloneDeployMode {
 		p.MemoryWatermark = ParamItem{
 			Key:          "datanode.memory.watermarkStandalone",
@@ -2930,8 +3090,8 @@ func (p *dataNodeConfig) init(base *BaseTable) {
 	p.FlushDeleteBufferBytes = ParamItem{
 		Key:          "dataNode.segment.deleteBufBytes",
 		Version:      "2.0.0",
-		DefaultValue: "67108864",
-		Doc:          "Max buffer size to flush del for a single channel",
+		DefaultValue: "16777216",
+		Doc:          "Max buffer size in bytes to flush del for a single channel, default as 16MB",
 		Export:       true,
 	}
 	p.FlushDeleteBufferBytes.Init(base.mgr)
@@ -3036,6 +3196,41 @@ func (p *dataNodeConfig) init(base *BaseTable) {
 		DefaultValue: "1000",
 	}
 	p.UpdateChannelCheckpointMaxParallel.Init(base.mgr)
+
+	p.UpdateChannelCheckpointInterval = ParamItem{
+		Key:          "datanode.channel.updateChannelCheckpointInterval",
+		Version:      "2.4.0",
+		Doc:          "the interval duration(in seconds) for datanode to update channel checkpoint of each channel",
+		DefaultValue: "60",
+	}
+	p.UpdateChannelCheckpointInterval.Init(base.mgr)
+
+	p.UpdateChannelCheckpointRPCTimeout = ParamItem{
+		Key:          "datanode.channel.updateChannelCheckpointInterval",
+		Version:      "2.4.0",
+		Doc:          "timeout in seconds for UpdateChannelCheckpoint RPC call",
+		DefaultValue: "10",
+	}
+	p.UpdateChannelCheckpointRPCTimeout.Init(base.mgr)
+
+	p.MaxConcurrentImportTaskNum = ParamItem{
+		Key:          "datanode.import.maxConcurrentTaskNum",
+		Version:      "2.4.0",
+		Doc:          "The maximum number of import/pre-import tasks allowed to run concurrently on a datanode.",
+		DefaultValue: "16",
+		PanicIfEmpty: false,
+		Export:       true,
+	}
+	p.MaxConcurrentImportTaskNum.Init(base.mgr)
+
+	p.L0BatchMemoryRatio = ParamItem{
+		Key:          "datanode.compaction.levelZeroBatchMemoryRatio",
+		Version:      "2.4.0",
+		Doc:          "The minimal memory ratio of free memory for level zero compaction executing in batch mode",
+		DefaultValue: "0.05",
+		Export:       true,
+	}
+	p.L0BatchMemoryRatio.Init(base.mgr)
 }
 
 // /////////////////////////////////////////////////////////////////////////////

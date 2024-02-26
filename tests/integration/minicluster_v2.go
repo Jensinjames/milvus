@@ -20,11 +20,13 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"path"
 	"sync"
 	"time"
 
 	"github.com/cockroachdb/errors"
 	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.uber.org/atomic"
 	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
@@ -43,11 +45,48 @@ import (
 	grpcrootcoord "github.com/milvus-io/milvus/internal/distributed/rootcoord"
 	grpcrootcoordclient "github.com/milvus-io/milvus/internal/distributed/rootcoord/client"
 	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/internal/util/dependency"
 	"github.com/milvus-io/milvus/pkg/log"
 	"github.com/milvus-io/milvus/pkg/util/etcd"
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
+
+var params *paramtable.ComponentParam = paramtable.Get()
+
+type ClusterConfig struct {
+	// ProxyNum int
+	// todo coord num can be more than 1 if enable Active-Standby
+	// RootCoordNum int
+	// DataCoordNum int
+	// IndexCoordNum int
+	// QueryCoordNum int
+	QueryNodeNum int
+	DataNodeNum  int
+	IndexNodeNum int
+}
+
+func DefaultParams() map[string]string {
+	testPath := fmt.Sprintf("integration-test-%d", time.Now().Unix())
+	return map[string]string{
+		params.EtcdCfg.RootPath.Key:  testPath,
+		params.MinioCfg.RootPath.Key: testPath,
+		//"runtime.role": typeutil.StandaloneRole,
+		//params.IntegrationTestCfg.IntegrationMode.Key: "true",
+		params.LocalStorageCfg.Path.Key:              path.Join("/tmp", testPath),
+		params.CommonCfg.StorageType.Key:             "local",
+		params.DataNodeCfg.MemoryForceSyncEnable.Key: "false", // local execution will print too many logs
+		params.CommonCfg.GracefulStopTimeout.Key:     "10",
+	}
+}
+
+func DefaultClusterConfig() ClusterConfig {
+	return ClusterConfig{
+		QueryNodeNum: 1,
+		DataNodeNum:  1,
+		IndexNodeNum: 1,
+	}
+}
 
 type MiniClusterV2 struct {
 	ctx context.Context
@@ -67,27 +106,34 @@ type MiniClusterV2 struct {
 	RootCoord  *grpcrootcoord.Server
 	QueryCoord *grpcquerycoord.Server
 
-	DataCoordClient  *grpcdatacoordclient.Client
-	RootCoordClient  *grpcrootcoordclient.Client
-	QueryCoordClient *grpcquerycoordclient.Client
+	DataCoordClient  types.DataCoordClient
+	RootCoordClient  types.RootCoordClient
+	QueryCoordClient types.QueryCoordClient
 
-	ProxyClient     *grpcproxyclient.Client
-	DataNodeClient  *grpcdatanodeclient.Client
-	QueryNodeClient *grpcquerynodeclient.Client
-	IndexNodeClient *grpcindexnodeclient.Client
+	ProxyClient     types.ProxyClient
+	DataNodeClient  types.DataNodeClient
+	QueryNodeClient types.QueryNodeClient
+	IndexNodeClient types.IndexNodeClient
 
 	DataNode  *grpcdatanode.Server
 	QueryNode *grpcquerynode.Server
 	IndexNode *grpcindexnode.Server
 
 	MetaWatcher MetaWatcher
+	ptmu        sync.Mutex
+	querynodes  []*grpcquerynode.Server
+	qnid        atomic.Int64
+	datanodes   []*grpcdatanode.Server
+	dnid        atomic.Int64
 }
 
 type OptionV2 func(cluster *MiniClusterV2)
 
 func StartMiniClusterV2(ctx context.Context, opts ...OptionV2) (*MiniClusterV2, error) {
 	cluster := &MiniClusterV2{
-		ctx: ctx,
+		ctx:  ctx,
+		qnid: *atomic.NewInt64(10000),
+		dnid: *atomic.NewInt64(20000),
 	}
 	paramtable.Init()
 	cluster.params = DefaultParams()
@@ -201,6 +247,62 @@ func StartMiniClusterV2(ctx context.Context, opts ...OptionV2) (*MiniClusterV2, 
 	return cluster, nil
 }
 
+func (cluster *MiniClusterV2) AddQueryNode() *grpcquerynode.Server {
+	cluster.ptmu.Lock()
+	defer cluster.ptmu.Unlock()
+	cluster.qnid.Inc()
+	id := cluster.qnid.Load()
+	oid := paramtable.GetNodeID()
+	log.Info(fmt.Sprintf("adding extra querynode with id:%d", id))
+	paramtable.SetNodeID(id)
+	node, err := grpcquerynode.NewServer(context.TODO(), cluster.factory)
+	if err != nil {
+		return nil
+	}
+	err = node.Run()
+	if err != nil {
+		return nil
+	}
+	paramtable.SetNodeID(oid)
+
+	req := &milvuspb.GetComponentStatesRequest{}
+	resp, err := node.GetComponentStates(context.TODO(), req)
+	if err != nil {
+		return nil
+	}
+	log.Info(fmt.Sprintf("querynode %d ComponentStates:%v", id, resp))
+	cluster.querynodes = append(cluster.querynodes, node)
+	return node
+}
+
+func (cluster *MiniClusterV2) AddDataNode() *grpcdatanode.Server {
+	cluster.ptmu.Lock()
+	defer cluster.ptmu.Unlock()
+	cluster.qnid.Inc()
+	id := cluster.qnid.Load()
+	oid := paramtable.GetNodeID()
+	log.Info(fmt.Sprintf("adding extra datanode with id:%d", id))
+	paramtable.SetNodeID(id)
+	node, err := grpcdatanode.NewServer(context.TODO(), cluster.factory)
+	if err != nil {
+		return nil
+	}
+	err = node.Run()
+	if err != nil {
+		return nil
+	}
+	paramtable.SetNodeID(oid)
+
+	req := &milvuspb.GetComponentStatesRequest{}
+	resp, err := node.GetComponentStates(context.TODO(), req)
+	if err != nil {
+		return nil
+	}
+	log.Info(fmt.Sprintf("datanode %d ComponentStates:%v", id, resp))
+	cluster.datanodes = append(cluster.datanodes, node)
+	return node
+}
+
 func (cluster *MiniClusterV2) Start() error {
 	log.Info("mini cluster start")
 	err := cluster.RootCoord.Run()
@@ -264,10 +366,8 @@ func (cluster *MiniClusterV2) Stop() error {
 	cluster.Proxy.Stop()
 	log.Info("mini cluster proxy stopped")
 
-	cluster.DataNode.Stop()
-	log.Info("mini cluster dataNode stopped")
-	cluster.QueryNode.Stop()
-	log.Info("mini cluster queryNode stopped")
+	cluster.StopAllDataNodes()
+	cluster.StopAllQueryNodes()
 	cluster.IndexNode.Stop()
 	log.Info("mini cluster indexNode stopped")
 
@@ -286,8 +386,32 @@ func (cluster *MiniClusterV2) Stop() error {
 	return nil
 }
 
+func (cluster *MiniClusterV2) StopAllQueryNodes() {
+	cluster.QueryNode.Stop()
+	log.Info("mini cluster main queryNode stopped")
+	numExtraQN := len(cluster.querynodes)
+	for _, node := range cluster.querynodes {
+		node.Stop()
+	}
+	log.Info(fmt.Sprintf("mini cluster stoped %d extra querynode", numExtraQN))
+}
+
+func (cluster *MiniClusterV2) StopAllDataNodes() {
+	cluster.DataNode.Stop()
+	log.Info("mini cluster main dataNode stopped")
+	numExtraQN := len(cluster.datanodes)
+	for _, node := range cluster.datanodes {
+		node.Stop()
+	}
+	log.Info(fmt.Sprintf("mini cluster stoped %d extra datanode", numExtraQN))
+}
+
 func (cluster *MiniClusterV2) GetContext() context.Context {
 	return cluster.ctx
+}
+
+func (cluster *MiniClusterV2) GetFactory() dependency.Factory {
+	return cluster.factory
 }
 
 func GetAvailablePorts(n int) ([]int, error) {

@@ -37,7 +37,7 @@ import (
 // If Limit function return true, the request will be rejected.
 // Otherwise, the request will pass. Limit also returns limit of limiter.
 type Limiter interface {
-	Check(collectionID int64, rt internalpb.RateType, n int) error
+	Check(collectionIDs []int64, rt internalpb.RateType, n int) error
 }
 
 // Component is the interface all services implement
@@ -75,6 +75,7 @@ type DataNodeComponent interface {
 
 	SetAddress(address string)
 	GetAddress() string
+	GetNodeID() int64
 
 	// SetEtcdClient set etcd client for DataNode
 	SetEtcdClient(etcdClient *clientv3.Client)
@@ -283,6 +284,7 @@ type QueryNodeComponent interface {
 
 	SetAddress(address string)
 	GetAddress() string
+	GetNodeID() int64
 
 	// SetEtcdClient set etcd client for QueryNode
 	SetEtcdClient(etcdClient *clientv3.Client)

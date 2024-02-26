@@ -81,10 +81,10 @@ ExecPlanNodeVisitor::ExecuteExprNodeInternal(
     bool& cache_offset_getted,
     std::vector<int64_t>& cache_offset) {
     bitset_holder.clear();
-    LOG_INFO("plannode: {}, active_count: {}, timestamp: {}",
-             plannode->ToString(),
-             active_count,
-             timestamp_);
+    LOG_DEBUG("plannode: {}, active_count: {}, timestamp: {}",
+              plannode->ToString(),
+              active_count,
+              timestamp_);
     auto plan = plan::PlanFragment(plannode);
     // TODO: get query id from proxy
     auto query_context = std::make_shared<milvus::exec::QueryContext>(
@@ -190,8 +190,8 @@ ExecPlanNodeVisitor::VectorVisitorImpl(VectorPlanNode& node) {
                            timestamp_,
                            final_view,
                            search_result);
-    if (search_result.iterators.has_value()) {
-        GroupBy(search_result.iterators.value(),
+    if (search_result.vector_iterators_.has_value()) {
+        GroupBy(search_result.vector_iterators_.value(),
                 node.search_info_,
                 search_result.group_by_values_,
                 *segment,

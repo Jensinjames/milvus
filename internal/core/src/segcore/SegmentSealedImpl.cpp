@@ -120,6 +120,36 @@ SegmentSealedImpl::LoadVecIndex(const LoadIndexInfo& info) {
 }
 
 void
+SegmentSealedImpl::WarmupChunkCache(const FieldId field_id) {
+    auto& field_meta = schema_->operator[](field_id);
+    AssertInfo(field_meta.is_vector(), "vector field is not vector type");
+
+    if (!get_bit(index_ready_bitset_, field_id) &&
+        !get_bit(binlog_index_bitset_, field_id)) {
+        return;
+    }
+
+    AssertInfo(vector_indexings_.is_ready(field_id),
+               "vector index is not ready");
+    auto field_indexing = vector_indexings_.get_field_indexing(field_id);
+    auto vec_index =
+        dynamic_cast<index::VectorIndex*>(field_indexing->indexing_.get());
+    AssertInfo(vec_index, "invalid vector indexing");
+
+    auto it = field_data_info_.field_infos.find(field_id.get());
+    AssertInfo(it != field_data_info_.field_infos.end(),
+               "cannot find binlog file for field: {}, seg: {}",
+               field_id.get(),
+               id_);
+    auto field_info = it->second;
+
+    auto cc = storage::ChunkCacheSingleton::GetInstance().GetChunkCache();
+    for (const auto& data_path : field_info.insert_files) {
+        auto column = cc->Read(data_path);
+    }
+}
+
+void
 SegmentSealedImpl::LoadScalarIndex(const LoadIndexInfo& info) {
     // NOTE: lock only when data is ready to avoid starvation
     auto field_id = FieldId(info.field_id);
@@ -146,12 +176,11 @@ SegmentSealedImpl::LoadScalarIndex(const LoadIndexInfo& info) {
     // reverse pk from scalar index and set pks to offset
     if (schema_->get_primary_field_id() == field_id) {
         AssertInfo(field_id.get() != -1, "Primary key is -1");
-        AssertInfo(insert_record_.empty_pks(), "already exists");
         switch (field_meta.get_data_type()) {
             case DataType::INT64: {
                 auto int64_index = dynamic_cast<index::ScalarIndex<int64_t>*>(
                     scalar_indexings_[field_id].get());
-                if (int64_index->HasRawData()) {
+                if (insert_record_.empty_pks() && int64_index->HasRawData()) {
                     for (int i = 0; i < row_count; ++i) {
                         insert_record_.insert_pk(int64_index->Reverse_Lookup(i),
                                                  i);
@@ -164,7 +193,7 @@ SegmentSealedImpl::LoadScalarIndex(const LoadIndexInfo& info) {
                 auto string_index =
                     dynamic_cast<index::ScalarIndex<std::string>*>(
                         scalar_indexings_[field_id].get());
-                if (string_index->HasRawData()) {
+                if (insert_record_.empty_pks() && string_index->HasRawData()) {
                     for (int i = 0; i < row_count; ++i) {
                         insert_record_.insert_pk(
                             string_index->Reverse_Lookup(i), i);
@@ -869,10 +898,12 @@ SegmentSealedImpl::get_vector(FieldId field_id,
             AssertInfo(path_to_column.count(data_path) != 0,
                        "column not found");
             const auto& column = path_to_column.at(data_path);
-            AssertInfo(offset_in_binlog * row_bytes < column->ByteSize(),
-                       fmt::format("column idx out of range, idx: {}, size: {}",
-                                   offset_in_binlog * row_bytes,
-                                   column->ByteSize()));
+            AssertInfo(
+                offset_in_binlog * row_bytes < column->ByteSize(),
+                "column idx out of range, idx: {}, size: {}, data_path: {}",
+                offset_in_binlog * row_bytes,
+                column->ByteSize(),
+                data_path);
             auto vector = &column->Data()[offset_in_binlog * row_bytes];
             std::memcpy(buf.data() + i * row_bytes, vector, row_bytes);
         }
@@ -899,8 +930,8 @@ SegmentSealedImpl::DropFieldData(const FieldId field_id) {
         auto& field_meta = schema_->operator[](field_id);
         std::unique_lock lck(mutex_);
         if (get_bit(field_data_ready_bitset_, field_id)) {
+            fields_.erase(field_id);
             set_bit(field_data_ready_bitset_, field_id, false);
-            insert_record_.drop_field_data(field_id);
         }
         if (get_bit(binlog_index_bitset_, field_id)) {
             set_bit(binlog_index_bitset_, field_id, false);
@@ -930,8 +961,6 @@ SegmentSealedImpl::check_search(const query::Plan* plan) const {
     AssertInfo(plan, "Search plan is null");
     AssertInfo(plan->extra_info_opt_.has_value(),
                "Extra info of search plan doesn't have value");
-
-    check_metric_type(plan, col_index_meta_);
 
     if (!is_system_field_ready()) {
         PanicInfo(
@@ -1481,64 +1510,90 @@ SegmentSealedImpl::mask_with_timestamps(BitsetType& bitset_chunk,
 
 bool
 SegmentSealedImpl::generate_binlog_index(const FieldId field_id) {
-    if (col_index_meta_ == nullptr)
+    if (col_index_meta_ == nullptr || !col_index_meta_->HasFiled(field_id)) {
         return false;
+    }
     auto& field_meta = schema_->operator[](field_id);
+    auto& field_index_meta = col_index_meta_->GetFieldIndexMeta(field_id);
+    auto& index_params = field_index_meta.GetIndexParams();
 
-    if (field_meta.is_vector() &&
-        field_meta.get_data_type() == DataType::VECTOR_FLOAT &&
-        segcore_config_.get_enable_interim_segment_index()) {
-        try {
-            auto& field_index_meta =
-                col_index_meta_->GetFieldIndexMeta(field_id);
-            auto& index_params = field_index_meta.GetIndexParams();
-            if (index_params.find(knowhere::meta::INDEX_TYPE) ==
-                    index_params.end() ||
-                index_params.at(knowhere::meta::INDEX_TYPE) ==
-                    knowhere::IndexEnum::INDEX_FAISS_IDMAP) {
-                return false;
-            }
-            // get binlog data and meta
-            auto row_count = num_rows_.value();
-            auto dim = field_meta.get_dim();
-            std::shared_ptr<ColumnBase> vec_data{};
-            {
-                // field should be exists.
-                // otherwise, out_of_range exception is thrown by fields_.at
-                std::shared_lock lck(mutex_);
-                vec_data = fields_.at(field_id);
-            }
-            auto dataset =
-                knowhere::GenDataSet(row_count, dim, (void*)vec_data->Data());
-            dataset->SetIsOwner(false);
-            // generate index params
-            auto field_binlog_config = std::unique_ptr<VecIndexConfig>(
-                new VecIndexConfig(row_count,
-                                   field_index_meta,
-                                   segcore_config_,
-                                   SegmentType::Sealed));
-            auto build_config = field_binlog_config->GetBuildBaseParams();
-            build_config[knowhere::meta::DIM] = std::to_string(dim);
-            build_config[knowhere::meta::NUM_BUILD_THREAD] = std::to_string(1);
-            auto index_metric = field_binlog_config->GetMetricType();
+    auto enable_binlog_index = [&]() {
+        // checkout config
+        if (!segcore_config_.get_enable_interim_segment_index()) {
+            return false;
+        }
+        // check data type
+        if (!field_meta.is_vector() ||
+            field_meta.get_data_type() != DataType::VECTOR_FLOAT) {
+            return false;
+        }
+        // check index type
+        if (index_params.find(knowhere::meta::INDEX_TYPE) ==
+                index_params.end() ||
+            field_index_meta.IsFlatIndex()) {
+            return false;
+        }
+        // check index exist
+        if (vector_indexings_.is_ready(field_id)) {
+            return false;
+        }
+        return true;
+    };
+    if (!enable_binlog_index()) {
+        return false;
+    }
+    try {
+        // get binlog data and meta
+        int64_t row_count;
+        {
+            std::shared_lock lck(mutex_);
+            row_count = num_rows_.value();
+        }
+        auto dim = field_meta.get_dim();
+        // generate index params
+        auto field_binlog_config = std::unique_ptr<VecIndexConfig>(
+            new VecIndexConfig(row_count,
+                               field_index_meta,
+                               segcore_config_,
+                               SegmentType::Sealed));
+        if (row_count < field_binlog_config->GetBuildThreshold()) {
+            return false;
+        }
+        auto build_config = field_binlog_config->GetBuildBaseParams();
+        build_config[knowhere::meta::DIM] = std::to_string(dim);
+        build_config[knowhere::meta::NUM_BUILD_THREAD] = std::to_string(1);
+        auto index_metric = field_binlog_config->GetMetricType();
 
-            index::IndexBasePtr vec_index =
-                std::make_unique<index::VectorMemIndex<float>>(
-                    field_binlog_config->GetIndexType(),
-                    index_metric,
-                    knowhere::Version::GetCurrentVersion().VersionNumber());
-            vec_index->BuildWithDataset(dataset, build_config);
+        std::shared_ptr<ColumnBase> vec_data{};
+        {
+            std::shared_lock lck(mutex_);
+            vec_data = fields_.at(field_id);
+        }
+        auto dataset =
+            knowhere::GenDataSet(row_count, dim, (void*)vec_data->Data());
+        dataset->SetIsOwner(false);
+
+        index::IndexBasePtr vec_index =
+            std::make_unique<index::VectorMemIndex<float>>(
+                field_binlog_config->GetIndexType(),
+                index_metric,
+                knowhere::Version::GetCurrentVersion().VersionNumber());
+        vec_index->BuildWithDataset(dataset, build_config);
+        if (enable_binlog_index()) {
+            std::unique_lock lck(mutex_);
             vector_indexings_.append_field_indexing(
                 field_id, index_metric, std::move(vec_index));
 
             vec_binlog_config_[field_id] = std::move(field_binlog_config);
             set_bit(binlog_index_bitset_, field_id, true);
-
-            return true;
-        } catch (std::exception& e) {
-            return false;
+            LOG_INFO(
+                "replace binlog with binlog index in segment {}, field {}.",
+                this->get_segment_id(),
+                field_id.get());
         }
-    } else {
+        return true;
+    } catch (std::exception& e) {
+        LOG_WARN("fail to generate binlog index, because {}", e.what());
         return false;
     }
 }

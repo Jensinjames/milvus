@@ -30,7 +30,6 @@ import (
 	"github.com/milvus-io/milvus/pkg/util/metric"
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/util/timerecord"
-	"github.com/milvus-io/milvus/pkg/util/tsoutil"
 	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
@@ -53,10 +52,11 @@ type searchTask struct {
 	result  *milvuspb.SearchResults
 	request *milvuspb.SearchRequest
 
-	tr             *timerecord.TimeRecorder
-	collectionName string
-	schema         *schemaInfo
-	requery        bool
+	tr               *timerecord.TimeRecorder
+	collectionName   string
+	schema           *schemaInfo
+	requery          bool
+	partitionKeyMode bool
 
 	userOutputFields []string
 
@@ -236,6 +236,31 @@ func getNq(req *milvuspb.SearchRequest) (int64, error) {
 	return req.GetNq(), nil
 }
 
+func (t *searchTask) CanSkipAllocTimestamp() bool {
+	var consistencyLevel commonpb.ConsistencyLevel
+	useDefaultConsistency := t.request.GetUseDefaultConsistency()
+	if !useDefaultConsistency {
+		consistencyLevel = t.request.GetConsistencyLevel()
+	} else {
+		collID, err := globalMetaCache.GetCollectionID(context.Background(), t.request.GetDbName(), t.request.GetCollectionName())
+		if err != nil { // err is not nil if collection not exists
+			log.Warn("search task get collectionID failed, can't skip alloc timestamp",
+				zap.String("collectionName", t.request.GetCollectionName()), zap.Error(err))
+			return false
+		}
+
+		collectionInfo, err2 := globalMetaCache.GetCollectionInfo(context.Background(), t.request.GetDbName(), t.request.GetCollectionName(), collID)
+		if err2 != nil {
+			log.Warn("search task get collection info failed, can't skip alloc timestamp",
+				zap.String("collectionName", t.request.GetCollectionName()), zap.Error(err))
+			return false
+		}
+		consistencyLevel = collectionInfo.consistencyLevel
+	}
+
+	return consistencyLevel != commonpb.ConsistencyLevel_Strong
+}
+
 func (t *searchTask) PreExecute(ctx context.Context) error {
 	ctx, sp := otel.Tracer(typeutil.ProxyRole).Start(ctx, "Proxy-Search-PreExecute")
 	defer sp.End()
@@ -250,23 +275,31 @@ func (t *searchTask) PreExecute(ctx context.Context) error {
 		return err
 	}
 
-	log := log.Ctx(ctx).With(zap.Int64("collID", collID), zap.String("collName", collectionName))
-
 	t.SearchRequest.DbID = 0 // todo
 	t.SearchRequest.CollectionID = collID
+	log := log.Ctx(ctx).With(zap.Int64("collID", collID), zap.String("collName", collectionName))
 	t.schema, err = globalMetaCache.GetCollectionSchema(ctx, t.request.GetDbName(), collectionName)
 	if err != nil {
 		log.Warn("get collection schema failed", zap.Error(err))
 		return err
 	}
 
-	partitionKeyMode, err := isPartitionKeyMode(ctx, t.request.GetDbName(), collectionName)
+	t.partitionKeyMode, err = isPartitionKeyMode(ctx, t.request.GetDbName(), collectionName)
 	if err != nil {
 		log.Warn("is partition key mode failed", zap.Error(err))
 		return err
 	}
-	if partitionKeyMode && len(t.request.GetPartitionNames()) != 0 {
+	if t.partitionKeyMode && len(t.request.GetPartitionNames()) != 0 {
 		return errors.New("not support manually specifying the partition names if partition key mode is used")
+	}
+
+	if !t.partitionKeyMode && len(t.request.GetPartitionNames()) > 0 {
+		// translate partition name to partition ids. Use regex-pattern to match partition name.
+		t.PartitionIDs, err = getPartitionIDs(ctx, t.request.GetDbName(), collectionName, t.request.GetPartitionNames())
+		if err != nil {
+			log.Warn("failed to get partition ids", zap.Error(err))
+			return err
+		}
 	}
 
 	t.request.OutputFields, t.userOutputFields, err = translateOutputFields(t.request.OutputFields, t.schema, false)
@@ -277,123 +310,9 @@ func (t *searchTask) PreExecute(ctx context.Context) error {
 	log.Debug("translate output fields",
 		zap.Strings("output fields", t.request.GetOutputFields()))
 
-	// fetch search_growing from search param
-	var ignoreGrowing bool
-	for i, kv := range t.request.GetSearchParams() {
-		if kv.GetKey() == IgnoreGrowingKey {
-			ignoreGrowing, err = strconv.ParseBool(kv.GetValue())
-			if err != nil {
-				return errors.New("parse search growing failed")
-			}
-			t.request.SearchParams = append(t.request.GetSearchParams()[:i], t.request.GetSearchParams()[i+1:]...)
-			break
-		}
-	}
-	t.SearchRequest.IgnoreGrowing = ignoreGrowing
-
-	// Manually update nq if not set.
-	nq, err := getNq(t.request)
+	err = initSearchRequest(ctx, t)
 	if err != nil {
-		log.Warn("failed to get nq", zap.Error(err))
-		return err
-	}
-	// Check if nq is valid:
-	// https://milvus.io/docs/limitations.md
-	if err := validateNQLimit(nq); err != nil {
-		return fmt.Errorf("%s [%d] is invalid, %w", NQKey, nq, err)
-	}
-	t.SearchRequest.Nq = nq
-	log = log.With(zap.Int64("nq", nq))
-
-	outputFieldIDs, err := getOutputFieldIDs(t.schema, t.request.GetOutputFields())
-	if err != nil {
-		log.Warn("fail to get output field ids", zap.Error(err))
-		return err
-	}
-	t.SearchRequest.OutputFieldsId = outputFieldIDs
-
-	partitionNames := t.request.GetPartitionNames()
-	if t.request.GetDslType() == commonpb.DslType_BoolExprV1 {
-		annsField, err := funcutil.GetAttrByKeyFromRepeatedKV(AnnsFieldKey, t.request.GetSearchParams())
-		if err != nil || len(annsField) == 0 {
-			vecFields := typeutil.GetVectorFieldSchemas(t.schema.CollectionSchema)
-			if len(vecFields) == 0 {
-				return errors.New(AnnsFieldKey + " not found in schema")
-			}
-
-			if enableMultipleVectorFields && len(vecFields) > 1 {
-				return errors.New("multiple anns_fields exist, please specify a anns_field in search_params")
-			}
-
-			annsField = vecFields[0].Name
-		}
-		queryInfo, offset, err := parseSearchInfo(t.request.GetSearchParams(), t.schema.CollectionSchema)
-		if err != nil {
-			return err
-		}
-		if queryInfo.GroupByFieldId != 0 {
-			t.SearchRequest.IgnoreGrowing = true
-			// for group by operation, currently, we ignore growing segments
-		}
-		t.offset = offset
-
-		plan, err := planparserv2.CreateSearchPlan(t.schema.CollectionSchema, t.request.Dsl, annsField, queryInfo)
-		if err != nil {
-			log.Warn("failed to create query plan", zap.Error(err),
-				zap.String("dsl", t.request.Dsl), // may be very large if large term passed.
-				zap.String("anns field", annsField), zap.Any("query info", queryInfo))
-			return merr.WrapErrParameterInvalidMsg("failed to create query plan: %v", err)
-		}
-		log.Debug("create query plan",
-			zap.String("dsl", t.request.Dsl), // may be very large if large term passed.
-			zap.String("anns field", annsField), zap.Any("query info", queryInfo))
-
-		if partitionKeyMode {
-			expr, err := ParseExprFromPlan(plan)
-			if err != nil {
-				log.Warn("failed to parse expr", zap.Error(err))
-				return err
-			}
-			partitionKeys := ParsePartitionKeys(expr)
-			hashedPartitionNames, err := assignPartitionKeys(ctx, t.request.GetDbName(), collectionName, partitionKeys)
-			if err != nil {
-				log.Warn("failed to assign partition keys", zap.Error(err))
-				return err
-			}
-
-			partitionNames = append(partitionNames, hashedPartitionNames...)
-		}
-
-		plan.OutputFieldIds = outputFieldIDs
-
-		t.SearchRequest.Topk = queryInfo.GetTopk()
-		t.SearchRequest.MetricType = queryInfo.GetMetricType()
-		t.SearchRequest.DslType = commonpb.DslType_BoolExprV1
-
-		estimateSize, err := t.estimateResultSize(nq, t.SearchRequest.Topk)
-		if err != nil {
-			log.Warn("failed to estimate result size", zap.Error(err))
-			return err
-		}
-		if estimateSize >= requeryThreshold {
-			t.requery = true
-			plan.OutputFieldIds = nil
-		}
-
-		t.SearchRequest.SerializedExprPlan, err = proto.Marshal(plan)
-		if err != nil {
-			return err
-		}
-
-		log.Debug("Proxy::searchTask::PreExecute",
-			zap.Int64s("plan.OutputFieldIds", plan.GetOutputFieldIds()),
-			zap.Stringer("plan", plan)) // may be very large if large term passed.
-	}
-
-	// translate partition name to partition ids. Use regex-pattern to match partition name.
-	t.SearchRequest.PartitionIDs, err = getPartitionIDs(ctx, t.request.GetDbName(), collectionName, partitionNames)
-	if err != nil {
-		log.Warn("failed to get partition ids", zap.Error(err))
+		log.Debug("init search request failed", zap.Error(err))
 		return err
 	}
 
@@ -420,17 +339,6 @@ func (t *searchTask) PreExecute(ctx context.Context) error {
 		}
 	}
 	t.SearchRequest.GuaranteeTimestamp = guaranteeTs
-
-	if deadline, ok := t.TraceCtx().Deadline(); ok {
-		t.SearchRequest.TimeoutTimestamp = tsoutil.ComposeTSByTime(deadline, 0)
-	}
-
-	t.SearchRequest.PlaceholderGroup = t.request.PlaceholderGroup
-
-	// Set username of this search request for feature like task scheduling.
-	if username, _ := GetCurUserFromContext(ctx); username != "" {
-		t.SearchRequest.Username = username
-	}
 
 	log.Debug("search PreExecute done.",
 		zap.Uint64("guarantee_ts", guaranteeTs),
@@ -616,7 +524,8 @@ func (t *searchTask) estimateResultSize(nq int64, topK int64) (int64, error) {
 func (t *searchTask) Requery() error {
 	queryReq := &milvuspb.QueryRequest{
 		Base: &commonpb.MsgBase{
-			MsgType: commonpb.MsgType_Retrieve,
+			MsgType:   commonpb.MsgType_Retrieve,
+			Timestamp: t.BeginTs(),
 		},
 		DbName:             t.request.GetDbName(),
 		CollectionName:     t.request.GetCollectionName(),
@@ -627,7 +536,7 @@ func (t *searchTask) Requery() error {
 		QueryParams:        t.request.GetSearchParams(),
 	}
 
-	return doRequery(t.ctx, t.GetCollectionID(), t.node, t.schema.CollectionSchema, queryReq, t.result, t.queryChannelsTs)
+	return doRequery(t.ctx, t.GetCollectionID(), t.node, t.schema.CollectionSchema, queryReq, t.result, t.queryChannelsTs, t.GetPartitionIDs())
 }
 
 func (t *searchTask) fillInEmptyResult(numQueries int64) {
@@ -681,6 +590,7 @@ func doRequery(ctx context.Context,
 	request *milvuspb.QueryRequest,
 	result *milvuspb.SearchResults,
 	queryChannelsTs map[string]Timestamp,
+	partitionIDs []int64,
 ) error {
 	outputFields := request.GetOutputFields()
 	pkField, err := typeutil.GetPrimaryFieldSchema(schema)
@@ -701,7 +611,8 @@ func doRequery(ctx context.Context,
 				commonpbutil.WithMsgType(commonpb.MsgType_Retrieve),
 				commonpbutil.WithSourceID(paramtable.GetNodeID()),
 			),
-			ReqID: paramtable.GetNodeID(),
+			ReqID:        paramtable.GetNodeID(),
+			PartitionIDs: partitionIDs, // use search partitionIDs
 		},
 		request:      request,
 		plan:         plan,
@@ -709,6 +620,7 @@ func doRequery(ctx context.Context,
 		lb:           node.(*Proxy).lbPolicy,
 		channelsMvcc: channelsMvcc,
 		fastSkip:     true,
+		reQuery:      true,
 	}
 	queryResult, err := node.(*Proxy).query(ctx, qt)
 	if err != nil {

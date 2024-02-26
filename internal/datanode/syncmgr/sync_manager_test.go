@@ -160,7 +160,7 @@ func (s *SyncManagerSuite) TestSubmit() {
 	manager, err := NewSyncManager(s.chunkManager, s.allocator)
 	s.NoError(err)
 	task := s.getSuiteSyncTask()
-	task.WithMetaWriter(BrokerMetaWriter(s.broker))
+	task.WithMetaWriter(BrokerMetaWriter(s.broker, 1))
 	task.WithTimeRange(50, 100)
 	task.WithCheckpoint(&msgpb.MsgPosition{
 		ChannelName: s.channelName,
@@ -192,7 +192,7 @@ func (s *SyncManagerSuite) TestCompacted() {
 	manager, err := NewSyncManager(s.chunkManager, s.allocator)
 	s.NoError(err)
 	task := s.getSuiteSyncTask()
-	task.WithMetaWriter(BrokerMetaWriter(s.broker))
+	task.WithMetaWriter(BrokerMetaWriter(s.broker, 1))
 	task.WithTimeRange(50, 100)
 	task.WithCheckpoint(&msgpb.MsgPosition{
 		ChannelName: s.channelName,
@@ -235,7 +235,7 @@ func (s *SyncManagerSuite) TestBlock() {
 
 	go func() {
 		task := s.getSuiteSyncTask()
-		task.WithMetaWriter(BrokerMetaWriter(s.broker))
+		task.WithMetaWriter(BrokerMetaWriter(s.broker, 1))
 		task.WithTimeRange(50, 100)
 		task.WithCheckpoint(&msgpb.MsgPosition{
 			ChannelName: s.channelName,
@@ -306,6 +306,23 @@ func (s *SyncManagerSuite) TestNewSyncManager() {
 
 	_, err = NewSyncManager(s.chunkManager, s.allocator)
 	s.Error(err)
+}
+
+func (s *SyncManagerSuite) TestTargetUpdated() {
+	manager, err := NewSyncManager(s.chunkManager, s.allocator)
+	s.NoError(err)
+
+	task := NewMockTask(s.T())
+	task.EXPECT().SegmentID().Return(1000)
+	task.EXPECT().Checkpoint().Return(&msgpb.MsgPosition{})
+	task.EXPECT().CalcTargetSegment().Return(1000, nil).Once()
+	task.EXPECT().CalcTargetSegment().Return(1001, nil).Once()
+	task.EXPECT().Run().Return(errTargetSegmentNotMatch).Once()
+	task.EXPECT().Run().Return(nil).Once()
+
+	f := manager.SyncData(context.Background(), task)
+	err, _ = f.Await()
+	s.NoError(err)
 }
 
 func TestSyncManager(t *testing.T) {

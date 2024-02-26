@@ -63,6 +63,8 @@ type queryTask struct {
 	lb               LBPolicy
 	channelsMvcc     map[string]Timestamp
 	fastSkip         bool
+
+	reQuery bool
 }
 
 type queryParams struct {
@@ -194,7 +196,7 @@ func createCntPlan(expr string, schema *schemapb.CollectionSchema) (*planpb.Plan
 
 	plan, err := planparserv2.CreateRetrievePlan(schema, expr)
 	if err != nil {
-		return nil, err
+		return nil, merr.WrapErrParameterInvalidMsg("failed to create query plan: %v", err)
 	}
 
 	plan.Node.(*planpb.PlanNode_Query).Query.IsCount = true
@@ -217,7 +219,7 @@ func (t *queryTask) createPlan(ctx context.Context) error {
 	if t.plan == nil {
 		t.plan, err = planparserv2.CreateRetrievePlan(schema.CollectionSchema, t.request.Expr)
 		if err != nil {
-			return err
+			return merr.WrapErrParameterInvalidMsg("failed to create query plan: %v", err)
 		}
 	}
 
@@ -238,6 +240,31 @@ func (t *queryTask) createPlan(ctx context.Context) error {
 		zap.String("requestType", "query"))
 
 	return nil
+}
+
+func (t *queryTask) CanSkipAllocTimestamp() bool {
+	var consistencyLevel commonpb.ConsistencyLevel
+	useDefaultConsistency := t.request.GetUseDefaultConsistency()
+	if !useDefaultConsistency {
+		consistencyLevel = t.request.GetConsistencyLevel()
+	} else {
+		collID, err := globalMetaCache.GetCollectionID(context.Background(), t.request.GetDbName(), t.request.GetCollectionName())
+		if err != nil { // err is not nil if collection not exists
+			log.Warn("query task get collectionID failed, can't skip alloc timestamp",
+				zap.String("collectionName", t.request.GetCollectionName()), zap.Error(err))
+			return false
+		}
+
+		collectionInfo, err2 := globalMetaCache.GetCollectionInfo(context.Background(), t.request.GetDbName(), t.request.GetCollectionName(), collID)
+		if err2 != nil {
+			log.Warn("query task get collection info failed, can't skip alloc timestamp",
+				zap.String("collectionName", t.request.GetCollectionName()), zap.Error(err))
+			return false
+		}
+		consistencyLevel = collectionInfo.consistencyLevel
+	}
+
+	return consistencyLevel != commonpb.ConsistencyLevel_Strong
 }
 
 func (t *queryTask) PreExecute(ctx context.Context) error {
@@ -327,23 +354,26 @@ func (t *queryTask) PreExecute(ctx context.Context) error {
 		return fmt.Errorf("empty expression should be used with limit")
 	}
 
-	partitionNames := t.request.GetPartitionNames()
-	if t.partitionKeyMode {
-		expr, err := ParseExprFromPlan(t.plan)
-		if err != nil {
-			return err
-		}
-		partitionKeys := ParsePartitionKeys(expr)
-		hashedPartitionNames, err := assignPartitionKeys(ctx, t.request.GetDbName(), t.request.CollectionName, partitionKeys)
-		if err != nil {
-			return err
-		}
+	// convert partition names only when requery is false
+	if !t.reQuery {
+		partitionNames := t.request.GetPartitionNames()
+		if t.partitionKeyMode {
+			expr, err := ParseExprFromPlan(t.plan)
+			if err != nil {
+				return err
+			}
+			partitionKeys := ParsePartitionKeys(expr)
+			hashedPartitionNames, err := assignPartitionKeys(ctx, t.request.GetDbName(), t.request.CollectionName, partitionKeys)
+			if err != nil {
+				return err
+			}
 
-		partitionNames = append(partitionNames, hashedPartitionNames...)
-	}
-	t.RetrieveRequest.PartitionIDs, err = getPartitionIDs(ctx, t.request.GetDbName(), t.request.CollectionName, partitionNames)
-	if err != nil {
-		return err
+			partitionNames = append(partitionNames, hashedPartitionNames...)
+		}
+		t.RetrieveRequest.PartitionIDs, err = getPartitionIDs(ctx, t.request.GetDbName(), t.request.CollectionName, partitionNames)
+		if err != nil {
+			return err
+		}
 	}
 
 	// count with pagination
@@ -362,7 +392,6 @@ func (t *queryTask) PreExecute(ctx context.Context) error {
 		t.RetrieveRequest.Username = username
 	}
 
-	t.MvccTimestamp = t.BeginTs()
 	collectionInfo, err2 := globalMetaCache.GetCollectionInfo(ctx, t.request.GetDbName(), collectionName, t.CollectionID)
 	if err2 != nil {
 		log.Warn("Proxy::queryTask::PreExecute failed to GetCollectionInfo from cache",
@@ -657,6 +686,9 @@ func (t *queryTask) EndTs() Timestamp {
 }
 
 func (t *queryTask) SetTs(ts Timestamp) {
+	if t.reQuery && t.Base.Timestamp != 0 {
+		return
+	}
 	t.Base.Timestamp = ts
 }
 

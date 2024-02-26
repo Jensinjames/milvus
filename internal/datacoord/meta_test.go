@@ -25,7 +25,6 @@ import (
 	"github.com/samber/lo"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
-	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
@@ -196,6 +195,99 @@ func (suite *MetaBasicSuite) TestCollection() {
 	suite.ElementsMatch(info.Partitions, collInfo.Partitions)
 
 	suite.MetricsEqual(metrics.DataCoordNumCollections.WithLabelValues(), 1)
+}
+
+func (suite *MetaBasicSuite) TestPrepareCompleteCompactionMutation() {
+	prepareSegments := &SegmentsInfo{
+		map[UniqueID]*SegmentInfo{
+			1: {SegmentInfo: &datapb.SegmentInfo{
+				ID:           1,
+				CollectionID: 100,
+				PartitionID:  10,
+				State:        commonpb.SegmentState_Flushed,
+				Binlogs:      []*datapb.FieldBinlog{getFieldBinlogIDs(1, 1, 2)},
+				Statslogs:    []*datapb.FieldBinlog{getFieldBinlogIDs(1, 1, 2)},
+				Deltalogs:    []*datapb.FieldBinlog{getFieldBinlogIDs(0, 1, 2)},
+				NumOfRows:    1,
+			}},
+			2: {SegmentInfo: &datapb.SegmentInfo{
+				ID:           2,
+				CollectionID: 100,
+				PartitionID:  10,
+				State:        commonpb.SegmentState_Flushed,
+				Binlogs:      []*datapb.FieldBinlog{getFieldBinlogIDs(1, 3, 4)},
+				Statslogs:    []*datapb.FieldBinlog{getFieldBinlogIDs(1, 3, 4)},
+				Deltalogs:    []*datapb.FieldBinlog{getFieldBinlogIDs(0, 3, 4)},
+				NumOfRows:    1,
+			}},
+		},
+	}
+
+	// m := suite.meta
+	m := &meta{
+		catalog:  &datacoord.Catalog{MetaKv: NewMetaMemoryKV()},
+		segments: prepareSegments,
+	}
+
+	plan := &datapb.CompactionPlan{
+		SegmentBinlogs: []*datapb.CompactionSegmentBinlogs{
+			{
+				SegmentID:           1,
+				FieldBinlogs:        []*datapb.FieldBinlog{getFieldBinlogIDs(1, 1, 2)},
+				Field2StatslogPaths: []*datapb.FieldBinlog{getFieldBinlogIDs(1, 1, 2)},
+				Deltalogs:           []*datapb.FieldBinlog{getFieldBinlogIDs(0, 1, 2)},
+			},
+			{
+				SegmentID:           2,
+				FieldBinlogs:        []*datapb.FieldBinlog{getFieldBinlogIDs(1, 3, 4)},
+				Field2StatslogPaths: []*datapb.FieldBinlog{getFieldBinlogIDs(1, 3, 4)},
+				Deltalogs:           []*datapb.FieldBinlog{getFieldBinlogIDs(0, 3, 4)},
+			},
+		},
+		StartTime: 15,
+	}
+
+	inSegment := &datapb.CompactionSegment{
+		SegmentID:           3,
+		InsertLogs:          []*datapb.FieldBinlog{getFieldBinlogIDs(1, 5)},
+		Field2StatslogPaths: []*datapb.FieldBinlog{getFieldBinlogIDs(1, 5)},
+		Deltalogs:           []*datapb.FieldBinlog{getFieldBinlogIDs(0, 5)},
+		NumOfRows:           2,
+	}
+	inCompactionResult := &datapb.CompactionPlanResult{
+		Segments: []*datapb.CompactionSegment{inSegment},
+	}
+	afterCompact, newSegment, metricMutation, err := m.prepareCompactionMutation(plan, inCompactionResult)
+	suite.NoError(err)
+	suite.NotNil(afterCompact)
+	suite.NotNil(newSegment)
+	suite.Equal(2, len(metricMutation.stateChange[datapb.SegmentLevel_Legacy.String()]))
+	suite.Equal(1, len(metricMutation.stateChange[datapb.SegmentLevel_L1.String()]))
+	suite.Equal(int64(0), metricMutation.rowCountChange)
+	suite.Equal(int64(2), metricMutation.rowCountAccChange)
+
+	suite.Require().Equal(2, len(afterCompact))
+	suite.Equal(commonpb.SegmentState_Dropped, afterCompact[0].GetState())
+	suite.Equal(commonpb.SegmentState_Dropped, afterCompact[1].GetState())
+	suite.NotZero(afterCompact[0].GetDroppedAt())
+	suite.NotZero(afterCompact[1].GetDroppedAt())
+
+	suite.Equal(inSegment.SegmentID, newSegment[0].GetID())
+	suite.Equal(UniqueID(100), newSegment[0].GetCollectionID())
+	suite.Equal(UniqueID(10), newSegment[0].GetPartitionID())
+	suite.Equal(inSegment.NumOfRows, newSegment[0].GetNumOfRows())
+	suite.Equal(commonpb.SegmentState_Flushed, newSegment[0].GetState())
+
+	suite.EqualValues(inSegment.GetInsertLogs(), newSegment[0].GetBinlogs())
+	suite.EqualValues(inSegment.GetField2StatslogPaths(), newSegment[0].GetStatslogs())
+	suite.EqualValues(inSegment.GetDeltalogs(), newSegment[0].GetDeltalogs())
+	suite.NotZero(newSegment[0].lastFlushTime)
+	suite.Equal(uint64(15), newSegment[0].GetLastExpireTime())
+
+	segmentsDone, metricMutationDone, err := m.CompleteCompactionMutation(plan, inCompactionResult)
+	suite.NoError(err)
+	suite.NotNil(segmentsDone)
+	suite.NotNil(metricMutationDone)
 }
 
 func TestMeta(t *testing.T) {
@@ -686,97 +778,10 @@ func TestMeta_alterMetaStore(t *testing.T) {
 		}},
 	}
 
-	err := m.alterMetaStoreAfterCompaction(&SegmentInfo{SegmentInfo: newSeg}, lo.Map(toAlter, func(t *datapb.SegmentInfo, _ int) *SegmentInfo {
+	err := m.alterMetaStoreAfterCompaction([]*SegmentInfo{{SegmentInfo: newSeg}}, lo.Map(toAlter, func(t *datapb.SegmentInfo, _ int) *SegmentInfo {
 		return &SegmentInfo{SegmentInfo: t}
 	}))
 	assert.NoError(t, err)
-}
-
-func TestMeta_PrepareCompleteCompactionMutation(t *testing.T) {
-	prepareSegments := &SegmentsInfo{
-		map[UniqueID]*SegmentInfo{
-			1: {SegmentInfo: &datapb.SegmentInfo{
-				ID:           1,
-				CollectionID: 100,
-				PartitionID:  10,
-				State:        commonpb.SegmentState_Flushed,
-				Binlogs:      []*datapb.FieldBinlog{getFieldBinlogIDs(1, 1, 2)},
-				Statslogs:    []*datapb.FieldBinlog{getFieldBinlogIDs(1, 1, 2)},
-				Deltalogs:    []*datapb.FieldBinlog{getFieldBinlogIDs(0, 1, 2)},
-				NumOfRows:    1,
-			}},
-			2: {SegmentInfo: &datapb.SegmentInfo{
-				ID:           2,
-				CollectionID: 100,
-				PartitionID:  10,
-				State:        commonpb.SegmentState_Flushed,
-				Binlogs:      []*datapb.FieldBinlog{getFieldBinlogIDs(1, 3, 4)},
-				Statslogs:    []*datapb.FieldBinlog{getFieldBinlogIDs(1, 3, 4)},
-				Deltalogs:    []*datapb.FieldBinlog{getFieldBinlogIDs(0, 3, 4)},
-				NumOfRows:    1,
-			}},
-		},
-	}
-
-	m := &meta{
-		catalog:  &datacoord.Catalog{MetaKv: NewMetaMemoryKV()},
-		segments: prepareSegments,
-	}
-
-	plan := &datapb.CompactionPlan{
-		SegmentBinlogs: []*datapb.CompactionSegmentBinlogs{
-			{
-				SegmentID:           1,
-				FieldBinlogs:        []*datapb.FieldBinlog{getFieldBinlogIDs(1, 1, 2)},
-				Field2StatslogPaths: []*datapb.FieldBinlog{getFieldBinlogIDs(1, 1, 2)},
-				Deltalogs:           []*datapb.FieldBinlog{getFieldBinlogIDs(0, 1, 2)},
-			},
-			{
-				SegmentID:           2,
-				FieldBinlogs:        []*datapb.FieldBinlog{getFieldBinlogIDs(1, 3, 4)},
-				Field2StatslogPaths: []*datapb.FieldBinlog{getFieldBinlogIDs(1, 3, 4)},
-				Deltalogs:           []*datapb.FieldBinlog{getFieldBinlogIDs(0, 3, 4)},
-			},
-		},
-		StartTime: 15,
-	}
-
-	inSegment := &datapb.CompactionSegment{
-		SegmentID:           3,
-		InsertLogs:          []*datapb.FieldBinlog{getFieldBinlogIDs(1, 5)},
-		Field2StatslogPaths: []*datapb.FieldBinlog{getFieldBinlogIDs(1, 5)},
-		Deltalogs:           []*datapb.FieldBinlog{getFieldBinlogIDs(0, 5)},
-		NumOfRows:           2,
-	}
-	inCompactionResult := &datapb.CompactionPlanResult{
-		Segments: []*datapb.CompactionSegment{inSegment},
-	}
-	afterCompact, newSegment, metricMutation, err := m.PrepareCompleteCompactionMutation(plan, inCompactionResult)
-	assert.NoError(t, err)
-	assert.NotNil(t, afterCompact)
-	assert.NotNil(t, newSegment)
-	assert.Equal(t, 2, len(metricMutation.stateChange[datapb.SegmentLevel_Legacy.String()]))
-	assert.Equal(t, 1, len(metricMutation.stateChange[datapb.SegmentLevel_L1.String()]))
-	assert.Equal(t, int64(0), metricMutation.rowCountChange)
-	assert.Equal(t, int64(2), metricMutation.rowCountAccChange)
-
-	require.Equal(t, 2, len(afterCompact))
-	assert.Equal(t, commonpb.SegmentState_Dropped, afterCompact[0].GetState())
-	assert.Equal(t, commonpb.SegmentState_Dropped, afterCompact[1].GetState())
-	assert.NotZero(t, afterCompact[0].GetDroppedAt())
-	assert.NotZero(t, afterCompact[1].GetDroppedAt())
-
-	assert.Equal(t, inSegment.SegmentID, newSegment.GetID())
-	assert.Equal(t, UniqueID(100), newSegment.GetCollectionID())
-	assert.Equal(t, UniqueID(10), newSegment.GetPartitionID())
-	assert.Equal(t, inSegment.NumOfRows, newSegment.GetNumOfRows())
-	assert.Equal(t, commonpb.SegmentState_Flushed, newSegment.GetState())
-
-	assert.EqualValues(t, inSegment.GetInsertLogs(), newSegment.GetBinlogs())
-	assert.EqualValues(t, inSegment.GetField2StatslogPaths(), newSegment.GetStatslogs())
-	assert.EqualValues(t, inSegment.GetDeltalogs(), newSegment.GetDeltalogs())
-	assert.NotZero(t, newSegment.lastFlushTime)
-	assert.Equal(t, uint64(15), newSegment.GetLastExpireTime())
 }
 
 func Test_meta_SetSegmentCompacting(t *testing.T) {
@@ -878,76 +883,39 @@ func Test_meta_SetSegmentImporting(t *testing.T) {
 }
 
 func Test_meta_GetSegmentsOfCollection(t *testing.T) {
-	type fields struct {
-		segments *SegmentsInfo
-	}
-	type args struct {
-		collectionID UniqueID
-	}
-	tests := []struct {
-		name   string
-		fields fields
-		args   args
-		expect []*SegmentInfo
-	}{
-		{
-			"test get segments",
-			fields{
-				&SegmentsInfo{
-					map[int64]*SegmentInfo{
-						1: {
-							SegmentInfo: &datapb.SegmentInfo{
-								ID:           1,
-								CollectionID: 1,
-								State:        commonpb.SegmentState_Flushed,
-							},
-						},
-						2: {
-							SegmentInfo: &datapb.SegmentInfo{
-								ID:           2,
-								CollectionID: 1,
-								State:        commonpb.SegmentState_Growing,
-							},
-						},
-						3: {
-							SegmentInfo: &datapb.SegmentInfo{
-								ID:           3,
-								CollectionID: 2,
-								State:        commonpb.SegmentState_Flushed,
-							},
-						},
-					},
+	storedSegments := &SegmentsInfo{
+		map[int64]*SegmentInfo{
+			1: {
+				SegmentInfo: &datapb.SegmentInfo{
+					ID:           1,
+					CollectionID: 1,
+					State:        commonpb.SegmentState_Flushed,
 				},
 			},
-			args{
-				collectionID: 1,
-			},
-			[]*SegmentInfo{
-				{
-					SegmentInfo: &datapb.SegmentInfo{
-						ID:           1,
-						CollectionID: 1,
-						State:        commonpb.SegmentState_Flushed,
-					},
+			2: {
+				SegmentInfo: &datapb.SegmentInfo{
+					ID:           2,
+					CollectionID: 1,
+					State:        commonpb.SegmentState_Growing,
 				},
-				{
-					SegmentInfo: &datapb.SegmentInfo{
-						ID:           2,
-						CollectionID: 1,
-						State:        commonpb.SegmentState_Growing,
-					},
+			},
+			3: {
+				SegmentInfo: &datapb.SegmentInfo{
+					ID:           3,
+					CollectionID: 2,
+					State:        commonpb.SegmentState_Flushed,
 				},
 			},
 		},
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			m := &meta{
-				segments: tt.fields.segments,
-			}
-			got := m.GetSegmentsOfCollection(tt.args.collectionID)
-			assert.ElementsMatch(t, tt.expect, got)
-		})
+	expectedSeg := map[int64]commonpb.SegmentState{1: commonpb.SegmentState_Flushed, 2: commonpb.SegmentState_Growing}
+	m := &meta{segments: storedSegments}
+	got := m.GetSegmentsOfCollection(1)
+	assert.Equal(t, len(expectedSeg), len(got))
+	for _, gotInfo := range got {
+		expected, ok := expectedSeg[gotInfo.ID]
+		assert.True(t, ok)
+		assert.Equal(t, expected, gotInfo.GetState())
 	}
 }
 

@@ -45,8 +45,14 @@ pipeline {
                     steps {
                         container('main') {
                             script {
+
                                 sh './build/set_docker_mirror.sh'
-                                sh "build/builder.sh /bin/bash -c \"make install\""
+                                sh """
+                                # disable dirty tag
+                                sed -i. 's/--dirty="-dev"//g' Makefile
+                                export IS_NETWORK_MODE_HOST="true"
+                                build/builder.sh /bin/bash -c \"make install\"
+                                """
 
                                 dir ("imageTag"){
                                     try{

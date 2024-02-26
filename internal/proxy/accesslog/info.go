@@ -166,11 +166,11 @@ func getMethodStatus(i *GrpcAccessInfo) string {
 		return fmt.Sprintf("Grpc%s", code.String())
 	}
 
-	if i.status.GetCode() != 0 {
+	if i.status.GetCode() != 0 || i.err != nil {
 		return "Failed"
 	}
 
-	return code.String()
+	return "Successful"
 }
 
 func getUserName(i *GrpcAccessInfo) string {
@@ -270,11 +270,11 @@ func getExpr(i *GrpcAccessInfo) string {
 func getSdkVersion(i *GrpcAccessInfo) string {
 	clientInfo := connection.GetManager().Get(i.ctx)
 	if clientInfo != nil {
-		return clientInfo.SdkType + "-" + clientInfo.SdkVersion
+		return clientInfo.GetSdkType() + "-" + clientInfo.GetSdkVersion()
 	}
 
 	if req, ok := i.req.(*milvuspb.ConnectRequest); ok {
-		return req.ClientInfo.SdkType + "-" + req.ClientInfo.SdkVersion
+		return req.GetClientInfo().GetSdkType() + "-" + req.GetClientInfo().GetSdkVersion()
 	}
 
 	return unknownString

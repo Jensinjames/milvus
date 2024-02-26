@@ -42,7 +42,6 @@ import (
 	"github.com/milvus-io/milvus/pkg/util/crypto"
 	"github.com/milvus-io/milvus/pkg/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/util/merr"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
@@ -762,92 +761,6 @@ func TestMetaCache_RemoveCollection(t *testing.T) {
 	assert.Equal(t, rootCoord.GetAccessCount(), 4)
 }
 
-func TestMetaCache_ExpireShardLeaderCache(t *testing.T) {
-	paramtable.Init()
-	paramtable.Get().Save(Params.ProxyCfg.ShardLeaderCacheInterval.Key, "1")
-
-	ctx := context.Background()
-	rootCoord := &MockRootCoordClientInterface{}
-	queryCoord := &mocks.MockQueryCoordClient{}
-	shardMgr := newShardClientMgr()
-	err := InitMetaCache(ctx, rootCoord, queryCoord, shardMgr)
-	assert.NoError(t, err)
-
-	queryCoord.EXPECT().GetShardLeaders(mock.Anything, mock.Anything).Return(&querypb.GetShardLeadersResponse{
-		Status: merr.Success(),
-		Shards: []*querypb.ShardLeadersList{
-			{
-				ChannelName: "channel-1",
-				NodeIds:     []int64{1, 2, 3},
-				NodeAddrs:   []string{"localhost:9000", "localhost:9001", "localhost:9002"},
-			},
-		},
-	}, nil)
-
-	nodeInfos, err := globalMetaCache.GetShards(ctx, true, dbName, "collection1", 1)
-	assert.NoError(t, err)
-	assert.Len(t, nodeInfos["channel-1"], 3)
-
-	queryCoord.ExpectedCalls = nil
-	queryCoord.EXPECT().GetShardLeaders(mock.Anything, mock.Anything).Return(&querypb.GetShardLeadersResponse{
-		Status: merr.Success(),
-		Shards: []*querypb.ShardLeadersList{
-			{
-				ChannelName: "channel-1",
-				NodeIds:     []int64{1, 2},
-				NodeAddrs:   []string{"localhost:9000", "localhost:9001"},
-			},
-		},
-	}, nil)
-
-	assert.Eventually(t, func() bool {
-		nodeInfos, err := globalMetaCache.GetShards(ctx, true, dbName, "collection1", 1)
-		assert.NoError(t, err)
-		return len(nodeInfos["channel-1"]) == 2
-	}, 3*time.Second, 1*time.Second)
-
-	queryCoord.ExpectedCalls = nil
-	queryCoord.EXPECT().GetShardLeaders(mock.Anything, mock.Anything).Return(&querypb.GetShardLeadersResponse{
-		Status: merr.Success(),
-		Shards: []*querypb.ShardLeadersList{
-			{
-				ChannelName: "channel-1",
-				NodeIds:     []int64{1, 2, 3},
-				NodeAddrs:   []string{"localhost:9000", "localhost:9001", "localhost:9002"},
-			},
-		},
-	}, nil)
-
-	assert.Eventually(t, func() bool {
-		nodeInfos, err := globalMetaCache.GetShards(ctx, true, dbName, "collection1", 1)
-		assert.NoError(t, err)
-		return len(nodeInfos["channel-1"]) == 3
-	}, 3*time.Second, 1*time.Second)
-
-	queryCoord.ExpectedCalls = nil
-	queryCoord.EXPECT().GetShardLeaders(mock.Anything, mock.Anything).Return(&querypb.GetShardLeadersResponse{
-		Status: merr.Success(),
-		Shards: []*querypb.ShardLeadersList{
-			{
-				ChannelName: "channel-1",
-				NodeIds:     []int64{1, 2, 3},
-				NodeAddrs:   []string{"localhost:9000", "localhost:9001", "localhost:9002"},
-			},
-			{
-				ChannelName: "channel-2",
-				NodeIds:     []int64{1, 2, 3},
-				NodeAddrs:   []string{"localhost:9000", "localhost:9001", "localhost:9002"},
-			},
-		},
-	}, nil)
-
-	assert.Eventually(t, func() bool {
-		nodeInfos, err := globalMetaCache.GetShards(ctx, true, dbName, "collection1", 1)
-		assert.NoError(t, err)
-		return len(nodeInfos["channel-1"]) == 3 && len(nodeInfos["channel-2"]) == 3
-	}, 3*time.Second, 1*time.Second)
-}
-
 func TestGlobalMetaCache_ShuffleShardLeaders(t *testing.T) {
 	shards := map[string][]nodeInfo{
 		"channel-1": {
@@ -902,4 +815,69 @@ func TestMetaCache_Database(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, globalMetaCache.HasDatabase(ctx, dbName), true)
 	assert.Equal(t, CheckDatabase(ctx, dbName), true)
+}
+
+func TestMetaCache_AllocID(t *testing.T) {
+	ctx := context.Background()
+	queryCoord := &mocks.MockQueryCoordClient{}
+	shardMgr := newShardClientMgr()
+
+	t.Run("success", func(t *testing.T) {
+		rootCoord := mocks.NewMockRootCoordClient(t)
+		rootCoord.EXPECT().AllocID(mock.Anything, mock.Anything).Return(&rootcoordpb.AllocIDResponse{
+			Status: merr.Status(nil),
+			ID:     11198,
+			Count:  10,
+		}, nil)
+		rootCoord.EXPECT().ListPolicy(mock.Anything, mock.Anything).Return(&internalpb.ListPolicyResponse{
+			Status:      merr.Success(),
+			PolicyInfos: []string{"policy1", "policy2", "policy3"},
+		}, nil)
+
+		err := InitMetaCache(ctx, rootCoord, queryCoord, shardMgr)
+		assert.NoError(t, err)
+		assert.Equal(t, globalMetaCache.HasDatabase(ctx, dbName), false)
+
+		id, err := globalMetaCache.AllocID(ctx)
+		assert.NoError(t, err)
+		assert.Equal(t, id, int64(11198))
+	})
+
+	t.Run("error", func(t *testing.T) {
+		rootCoord := mocks.NewMockRootCoordClient(t)
+		rootCoord.EXPECT().AllocID(mock.Anything, mock.Anything).Return(&rootcoordpb.AllocIDResponse{
+			Status: merr.Status(nil),
+		}, fmt.Errorf("mock error"))
+		rootCoord.EXPECT().ListPolicy(mock.Anything, mock.Anything).Return(&internalpb.ListPolicyResponse{
+			Status:      merr.Success(),
+			PolicyInfos: []string{"policy1", "policy2", "policy3"},
+		}, nil)
+
+		err := InitMetaCache(ctx, rootCoord, queryCoord, shardMgr)
+		assert.NoError(t, err)
+		assert.Equal(t, globalMetaCache.HasDatabase(ctx, dbName), false)
+
+		id, err := globalMetaCache.AllocID(ctx)
+		assert.Error(t, err)
+		assert.Equal(t, id, int64(0))
+	})
+
+	t.Run("failed", func(t *testing.T) {
+		rootCoord := mocks.NewMockRootCoordClient(t)
+		rootCoord.EXPECT().AllocID(mock.Anything, mock.Anything).Return(&rootcoordpb.AllocIDResponse{
+			Status: merr.Status(fmt.Errorf("mock failed")),
+		}, nil)
+		rootCoord.EXPECT().ListPolicy(mock.Anything, mock.Anything).Return(&internalpb.ListPolicyResponse{
+			Status:      merr.Success(),
+			PolicyInfos: []string{"policy1", "policy2", "policy3"},
+		}, nil)
+
+		err := InitMetaCache(ctx, rootCoord, queryCoord, shardMgr)
+		assert.NoError(t, err)
+		assert.Equal(t, globalMetaCache.HasDatabase(ctx, dbName), false)
+
+		id, err := globalMetaCache.AllocID(ctx)
+		assert.Error(t, err)
+		assert.Equal(t, id, int64(0))
+	})
 }

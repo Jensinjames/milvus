@@ -24,6 +24,58 @@ func (_m *MockCache) EXPECT() *MockCache_Expecter {
 	return &MockCache_Expecter{mock: &_m.Mock}
 }
 
+// AllocID provides a mock function with given fields: ctx
+func (_m *MockCache) AllocID(ctx context.Context) (int64, error) {
+	ret := _m.Called(ctx)
+
+	var r0 int64
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context) (int64, error)); ok {
+		return rf(ctx)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context) int64); ok {
+		r0 = rf(ctx)
+	} else {
+		r0 = ret.Get(0).(int64)
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context) error); ok {
+		r1 = rf(ctx)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
+// MockCache_AllocID_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'AllocID'
+type MockCache_AllocID_Call struct {
+	*mock.Call
+}
+
+// AllocID is a helper method to define mock.On call
+//   - ctx context.Context
+func (_e *MockCache_Expecter) AllocID(ctx interface{}) *MockCache_AllocID_Call {
+	return &MockCache_AllocID_Call{Call: _e.mock.On("AllocID", ctx)}
+}
+
+func (_c *MockCache_AllocID_Call) Run(run func(ctx context.Context)) *MockCache_AllocID_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(context.Context))
+	})
+	return _c
+}
+
+func (_c *MockCache_AllocID_Call) Return(_a0 int64, _a1 error) *MockCache_AllocID_Call {
+	_c.Call.Return(_a0, _a1)
+	return _c
+}
+
+func (_c *MockCache_AllocID_Call) RunAndReturn(run func(context.Context) (int64, error)) *MockCache_AllocID_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
 // DeprecateShardCache provides a mock function with given fields: database, collectionName
 func (_m *MockCache) DeprecateShardCache(database string, collectionName string) {
 	_m.Called(database, collectionName)
@@ -1035,39 +1087,6 @@ func (_c *MockCache_UpdateCredential_Call) Return() *MockCache_UpdateCredential_
 }
 
 func (_c *MockCache_UpdateCredential_Call) RunAndReturn(run func(*internalpb.CredentialInfo)) *MockCache_UpdateCredential_Call {
-	_c.Call.Return(run)
-	return _c
-}
-
-// expireShardLeaderCache provides a mock function with given fields: ctx
-func (_m *MockCache) expireShardLeaderCache(ctx context.Context) {
-	_m.Called(ctx)
-}
-
-// MockCache_expireShardLeaderCache_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'expireShardLeaderCache'
-type MockCache_expireShardLeaderCache_Call struct {
-	*mock.Call
-}
-
-// expireShardLeaderCache is a helper method to define mock.On call
-//   - ctx context.Context
-func (_e *MockCache_Expecter) expireShardLeaderCache(ctx interface{}) *MockCache_expireShardLeaderCache_Call {
-	return &MockCache_expireShardLeaderCache_Call{Call: _e.mock.On("expireShardLeaderCache", ctx)}
-}
-
-func (_c *MockCache_expireShardLeaderCache_Call) Run(run func(ctx context.Context)) *MockCache_expireShardLeaderCache_Call {
-	_c.Call.Run(func(args mock.Arguments) {
-		run(args[0].(context.Context))
-	})
-	return _c
-}
-
-func (_c *MockCache_expireShardLeaderCache_Call) Return() *MockCache_expireShardLeaderCache_Call {
-	_c.Call.Return()
-	return _c
-}
-
-func (_c *MockCache_expireShardLeaderCache_Call) RunAndReturn(run func(context.Context)) *MockCache_expireShardLeaderCache_Call {
 	_c.Call.Return(run)
 	return _c
 }
